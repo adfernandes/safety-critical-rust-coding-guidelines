@@ -28,3 +28,4 @@ Coding Guidelines
    macros
    ffi
    inline-assembly
+   floating-point
