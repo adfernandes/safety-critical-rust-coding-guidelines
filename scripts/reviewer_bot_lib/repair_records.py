@@ -8,6 +8,14 @@ _REPAIR_MARKER_KEYS = (
     "review_repair",
     "head_observation_repair",
     "status_label_projection",
+    "issue_snapshot_read",
+    "warning_dedupe_read",
+    "warning_post",
+    "transition_dedupe_read",
+    "transition_post",
+    "assignment_add_write",
+    "assignment_remove_write",
+    "assignment_confirm_read",
 )
 
 
@@ -71,6 +79,8 @@ def load_repair_marker(review_data: dict, key: str) -> dict | None:
 def clear_repair_marker(review_data: dict, key: str) -> bool:
     markers = repair_markers(review_data)
     if key not in markers:
+        return False
+    if not isinstance(markers.get(key), dict):
         return False
     markers[key] = None
     return True

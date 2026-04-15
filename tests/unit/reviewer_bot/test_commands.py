@@ -32,6 +32,7 @@ def test_label_signoff_create_pr_marks_issue_review_complete_without_inline_stat
         body="@guidelines-bot /label +sign-off: create pr",
         issue_author="dana",
         is_pull_request=False,
+        issue_labels=("coding guideline",),
     )
     harness.runtime.github.get_repo_labels = lambda: ["sign-off: create pr"]
     harness.runtime.github.add_label = lambda issue_number, label: True
@@ -45,6 +46,29 @@ def test_label_signoff_create_pr_marks_issue_review_complete_without_inline_stat
     assert review["review_completion_source"] == "issue_label: sign-off: create pr"
     assert review["current_cycle_completion"]["completed"] is True
     assert posted == [(42, "✅ Added label `sign-off: create pr`")]
+
+
+def test_label_signoff_create_pr_on_generic_issue_does_not_mark_issue_complete(monkeypatch):
+    harness = CommandHarness(monkeypatch)
+    state = make_state()
+    review = review_state.ensure_review_entry(state, 42, create=True)
+    assert review is not None
+    review["current_reviewer"] = "alice"
+    request = harness.typed_comment_request(
+        issue_number=42,
+        actor="alice",
+        body="@guidelines-bot /label +sign-off: create pr",
+        issue_author="dana",
+        is_pull_request=False,
+        issue_labels=(),
+    )
+    harness.runtime.github.get_repo_labels = lambda: ["sign-off: create pr"]
+    harness.runtime.github.add_label = lambda issue_number, label: True
+    harness.runtime.github.add_reaction = lambda *args, **kwargs: True
+    harness.runtime.github.post_comment = lambda *args, **kwargs: True
+
+    assert harness.handle_comment_event(state, request=request) is False
+    assert review["review_completion_source"] is None
 
 
 def test_label_signoff_create_pr_on_pr_does_not_mark_issue_complete(monkeypatch):
@@ -182,7 +206,6 @@ def test_pass_command_posts_pr_guidance_for_new_reviewer(monkeypatch):
     request = harness.typed_assignment_request(issue_number=42, issue_author="PLeVasseur", is_pull_request=True)
     harness.stub_assignees(["alice"])
     harness.stub_assignment()
-    harness.runtime.github.remove_pr_reviewer = lambda issue_number, username: True
     posted = []
     harness.runtime.github.post_comment = lambda issue_number, body: posted.append(body) or True
 
@@ -208,6 +231,127 @@ def test_assign_from_queue_posts_guidance_only_once(monkeypatch):
     assert success is True
     assert response == "✅ @felix91gr (next in queue) has been assigned as reviewer."
     assert posted == [guidance.get_pr_guidance("felix91gr", "PLeVasseur")]
+
+
+def test_done_command_marks_generic_issue_review_complete_for_current_reviewer(monkeypatch):
+    harness = CommandHarness(monkeypatch)
+    state = make_state()
+    review = review_state.ensure_review_entry(state, 42, create=True)
+    assert review is not None
+    review["current_reviewer"] = "alice"
+    request = harness.typed_assignment_request(issue_number=42, issue_author="dana", is_pull_request=False, issue_labels=())
+    harness.stub_assignees(["alice"])
+
+    response, success = commands.handle_done_command(harness.runtime, state, 42, "alice", request=request)
+
+    assert success is True
+    assert response == "✅ Review marked complete."
+    assert review["review_completion_source"] == "command: /done"
+
+
+def test_done_command_rejects_pull_requests(monkeypatch):
+    harness = CommandHarness(monkeypatch)
+    state = make_state()
+    request = harness.typed_assignment_request(issue_number=42, issue_author="dana", is_pull_request=True, issue_labels=())
+
+    response, success = commands.handle_done_command(harness.runtime, state, 42, "alice", request=request)
+
+    assert success is False
+    assert "not supported on pull requests" in response
+
+
+def test_done_command_rejects_coding_guideline_issues(monkeypatch):
+    harness = CommandHarness(monkeypatch)
+    state = make_state()
+    review = review_state.ensure_review_entry(state, 42, create=True)
+    assert review is not None
+    request = harness.typed_assignment_request(
+        issue_number=42,
+        issue_author="dana",
+        is_pull_request=False,
+        issue_labels=("coding guideline",),
+    )
+
+    response, success = commands.handle_done_command(harness.runtime, state, 42, "alice", request=request)
+
+    assert success is False
+    assert "Use `sign-off: create pr`" in response
+
+
+def test_done_command_allows_triage_maintainer_when_current_reviewer_differs(monkeypatch):
+    harness = CommandHarness(monkeypatch)
+    state = make_state()
+    review = review_state.ensure_review_entry(state, 42, create=True)
+    assert review is not None
+    review["current_reviewer"] = "alice"
+    request = harness.typed_assignment_request(issue_number=42, issue_author="dana", is_pull_request=False, issue_labels=(FLS_AUDIT_LABEL,))
+    harness.stub_assignees(["alice"])
+    harness.runtime.github.get_user_permission_status = lambda username, required_permission="triage": "granted"
+
+    response, success = commands.handle_done_command(harness.runtime, state, 42, "bob", request=request)
+
+    assert success is True
+    assert response == "✅ Review marked complete."
+    assert review["review_completed_by"] == "bob"
+
+
+def test_pass_command_does_not_mutate_reviewer_state_when_remove_fails(monkeypatch):
+    harness = CommandHarness(monkeypatch)
+    state = make_state()
+    state["queue"] = [
+        {"github": "alice", "name": "Alice"},
+        {"github": "bob", "name": "Bob"},
+    ]
+    review = review_state.ensure_review_entry(state, 42, create=True)
+    assert review is not None
+    review["current_reviewer"] = "alice"
+    review["skipped"] = []
+    harness.stub_assignees(["alice"])
+    harness.runtime.github.remove_issue_assignee = lambda issue_number, username: False
+
+    response, success = harness.handle_pass(state, 42, "alice", None)
+
+    assert success is False
+    assert "could not confirm @bob as reviewer" in response
+    assert review["current_reviewer"] == "alice"
+    assert review["skipped"] == []
+
+
+def test_release_command_does_not_clear_reviewer_state_when_remove_fails(monkeypatch):
+    harness = CommandHarness(monkeypatch)
+    state = make_state()
+    review = review_state.ensure_review_entry(state, 42, create=True)
+    assert review is not None
+    review["current_reviewer"] = "alice"
+    harness.stub_assignees(["alice"])
+    harness.runtime.github.remove_issue_assignee = lambda issue_number, username: False
+
+    response, success = harness.handle_release(state, 42, "alice")
+
+    assert success is False
+    assert "could not confirm @alice as reviewer" in response
+    assert review["current_reviewer"] == "alice"
+
+
+def test_away_command_does_not_mutate_queue_when_reassignment_is_unconfirmed(monkeypatch):
+    harness = CommandHarness(monkeypatch)
+    state = make_state()
+    state["queue"] = [
+        {"github": "alice", "name": "Alice"},
+        {"github": "bob", "name": "Bob"},
+    ]
+    review = review_state.ensure_review_entry(state, 42, create=True)
+    assert review is not None
+    review["current_reviewer"] = "alice"
+    harness.stub_assignees(["alice"])
+    harness.runtime.github.remove_issue_assignee = lambda issue_number, username: False
+
+    response, success = harness.handle_pass_until(state, 42, "alice", "2099-01-01", None)
+
+    assert success is False
+    assert "could not confirm @bob as reviewer" in response
+    assert [member["github"] for member in state["queue"]] == ["alice", "bob"]
+    assert state["pass_until"] == []
 
 
 def test_handle_accept_no_fls_changes_command_fails_closed_when_permission_unavailable(monkeypatch):
@@ -321,6 +465,7 @@ def test_handle_rectify_command_reports_permission_unavailable(monkeypatch):
     state = make_state()
     harness = CommandHarness(monkeypatch)
     monkeypatch.setattr(reconcile, "ensure_review_entry", lambda current, issue_number, create=False: None)
+    harness.runtime.github.get_issue_assignees = lambda issue_number: []
     harness.runtime.github.get_user_permission_status = lambda username, required_permission="triage": "unavailable"
 
     message, success, changed = harness.handle_rectify(state, 42, "alice")
@@ -334,6 +479,7 @@ def test_handle_rectify_command_reports_permission_denied(monkeypatch):
     state = make_state()
     harness = CommandHarness(monkeypatch)
     monkeypatch.setattr(reconcile, "ensure_review_entry", lambda current, issue_number, create=False: None)
+    harness.runtime.github.get_issue_assignees = lambda issue_number: []
     harness.runtime.github.get_user_permission_status = lambda username, required_permission="triage": "denied"
 
     message, success, changed = harness.handle_rectify(state, 42, "alice")
@@ -341,6 +487,22 @@ def test_handle_rectify_command_reports_permission_denied(monkeypatch):
     assert success is False
     assert changed is False
     assert "Only maintainers with triage+ permission" in message
+
+
+def test_handle_rectify_command_uses_live_assignee_truth_over_stored_reviewer(monkeypatch):
+    state = make_state()
+    harness = CommandHarness(monkeypatch)
+    review = review_state.ensure_review_entry(state, 42, create=True)
+    assert review is not None
+    review["current_reviewer"] = "alice"
+    harness.runtime.github.get_issue_assignees = lambda issue_number: ["bob"]
+    harness.runtime.github.get_user_permission_status = lambda username, required_permission="triage": "denied"
+
+    message, success, changed = harness.handle_rectify(state, 42, "alice")
+
+    assert success is False
+    assert changed is False
+    assert "@bob" in message
 
 
 def test_validate_accept_no_fls_changes_handoff_distinguishes_permission_unavailable(monkeypatch):

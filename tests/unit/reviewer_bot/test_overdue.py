@@ -1,11 +1,15 @@
 from datetime import timedelta
 
+import pytest
+
 from scripts.reviewer_bot_core import approval_policy
 from scripts.reviewer_bot_lib import maintenance, review_state
+from scripts.reviewer_bot_lib.repair_records import load_repair_marker
 from tests.fixtures.fake_runtime import FakeReviewerBotRuntime
 from tests.fixtures.reviewer_bot import (
     accept_contributor_comment,
     accept_contributor_revision,
+    accept_reviewer_comment,
     accept_reviewer_review,
     iso_z,
     issue_snapshot,
@@ -52,12 +56,31 @@ def test_check_overdue_reviews_consumes_only_stable_reviewer_response_fields(mon
     anchor_timestamp = iso_z(now - timedelta(days=runtime.REVIEW_DEADLINE_DAYS + 1))
     state = make_state()
     make_tracked_review_state(state, 42, reviewer="alice", assigned_at=anchor_timestamp, active_cycle_started_at=anchor_timestamp)
-    runtime.github.get_issue_or_pr_snapshot = lambda issue_number: issue_snapshot(issue_number, state="open", is_pull_request=True)
+    runtime.github.get_issue_or_pr_snapshot_result = lambda issue_number: runtime.GitHubApiResult(
+        200,
+        issue_snapshot(issue_number, state="open", is_pull_request=True),
+        {},
+        "ok",
+        True,
+        None,
+        0,
+        None,
+    )
     runtime.adapters.review_state.compute_reviewer_response_state = lambda issue_number, review_data, **kwargs: {
         "state": "awaiting_reviewer_response",
         "anchor_timestamp": anchor_timestamp,
         "ignored": {"reviewer_review": "not consumed"},
     }
+    runtime.github.get_issue_assignees_result = lambda issue_number, is_pull_request=None: runtime.GitHubApiResult(
+        200,
+        ["alice"],
+        {},
+        "ok",
+        True,
+        None,
+        0,
+        None,
+    )
 
     overdue = maintenance.check_overdue_reviews(runtime, state)
 
@@ -69,6 +92,8 @@ def test_check_overdue_reviews_consumes_only_stable_reviewer_response_fields(mon
             "days_since_warning": 0,
             "needs_warning": True,
             "needs_transition": False,
+            "anchor_reason": None,
+            "anchor_timestamp": anchor_timestamp,
         }
     ]
 
@@ -81,9 +106,61 @@ def test_check_overdue_reviews_skips_item_when_snapshot_unavailable(monkeypatch)
     review["assigned_at"] = "2026-03-01T00:00:00Z"
     review["last_reviewer_activity"] = "2026-03-01T00:00:00Z"
     runtime = FakeReviewerBotRuntime(monkeypatch)
-    runtime.github.get_issue_or_pr_snapshot = lambda issue_number: None
+    runtime.github.get_issue_or_pr_snapshot_result = lambda issue_number: runtime.GitHubApiResult(
+        502,
+        None,
+        {},
+        "bad gateway",
+        False,
+        "server_error",
+        1,
+        None,
+    )
 
     assert maintenance.check_overdue_reviews(runtime, state) == []
+
+
+def test_check_overdue_reviews_suppresses_stale_reviewer_authority_and_records_diagnostic(monkeypatch):
+    runtime = FakeReviewerBotRuntime(monkeypatch)
+    now = runtime.datetime.now(runtime.timezone.utc)
+    anchor_timestamp = iso_z(now - timedelta(days=runtime.REVIEW_DEADLINE_DAYS + 1))
+    state = make_state()
+    review = make_tracked_review_state(
+        state,
+        42,
+        reviewer="alice",
+        assigned_at=anchor_timestamp,
+        active_cycle_started_at=anchor_timestamp,
+    )
+    runtime.github.get_issue_or_pr_snapshot_result = lambda issue_number: runtime.GitHubApiResult(
+        200,
+        issue_snapshot(issue_number, state="open", is_pull_request=False),
+        {},
+        "ok",
+        True,
+        None,
+        0,
+        None,
+    )
+    runtime.github.get_issue_assignees_result = lambda issue_number, is_pull_request=None: runtime.GitHubApiResult(
+        200,
+        ["bob"],
+        {},
+        "ok",
+        True,
+        None,
+        0,
+        None,
+    )
+    runtime.adapters.review_state.compute_reviewer_response_state = lambda issue_number, review_data, **kwargs: {
+        "state": "awaiting_reviewer_response",
+        "anchor_timestamp": anchor_timestamp,
+    }
+
+    assert maintenance.check_overdue_reviews(runtime, state) == []
+    marker = load_repair_marker(review, "assignment_confirm_read")
+    assert marker is not None
+    assert marker["reason"] == "stored_reviewer_mismatch"
 
 
 def test_handle_overdue_review_warning_only_records_successful_comment(monkeypatch):
@@ -91,10 +168,177 @@ def test_handle_overdue_review_warning_only_records_successful_comment(monkeypat
     review = review_state.ensure_review_entry(state, 42, create=True)
     assert review is not None
     runtime = FakeReviewerBotRuntime(monkeypatch)
-    runtime.github.post_comment = lambda issue_number, body: False
+    runtime.github.list_issue_comments_result = lambda issue_number, page=1, per_page=100: runtime.GitHubApiResult(
+        200,
+        [],
+        {},
+        "ok",
+        True,
+        None,
+        0,
+        None,
+    )
+    runtime.github.post_comment_result = lambda issue_number, body: runtime.GitHubApiResult(
+        502,
+        None,
+        {},
+        "bad gateway",
+        False,
+        "server_error",
+        1,
+        None,
+    )
 
-    assert maintenance.handle_overdue_review_warning(runtime, state, 42, "alice") is False
+    assert maintenance.handle_overdue_review_warning(runtime, state, 42, "alice") is True
     assert review["transition_warning_sent"] is None
+    assert load_repair_marker(review, "warning_post")["failure_kind"] == "server_error"
+
+
+def test_handle_overdue_review_warning_uses_contributor_handoff_text(monkeypatch):
+    state = make_state()
+    review = review_state.ensure_review_entry(state, 42, create=True)
+    assert review is not None
+    runtime = FakeReviewerBotRuntime(monkeypatch)
+    posted = []
+    runtime.github.list_issue_comments_result = lambda issue_number, page=1, per_page=100: runtime.GitHubApiResult(
+        200,
+        [],
+        {},
+        "ok",
+        True,
+        None,
+        0,
+        None,
+    )
+    runtime.github.post_comment_result = (
+        lambda issue_number, body: posted.append(body)
+        or runtime.GitHubApiResult(201, {}, {}, "created", True, None, 0, None)
+    )
+
+    assert maintenance.handle_overdue_review_warning(
+        runtime,
+        state,
+        42,
+        "alice",
+        anchor_reason="contributor_comment_newer",
+    ) is True
+    assert "latest contributor follow-up returned this review to you" in posted[0]
+    assert "since you were assigned" not in posted[0]
+    assert posted[0].splitlines()[0] == "<!-- reviewer-bot:transition-warning:v1 issue=42 reviewer=alice anchor= -->"
+
+
+def test_handle_overdue_review_warning_backfills_existing_marker_without_repost(monkeypatch):
+    state = make_state()
+    review = review_state.ensure_review_entry(state, 42, create=True)
+    assert review is not None
+    runtime = FakeReviewerBotRuntime(monkeypatch)
+    runtime.github.list_issue_comments_result = lambda issue_number, page=1, per_page=100: runtime.GitHubApiResult(
+        200,
+        [
+            {
+                "id": 99,
+                "created_at": "2026-03-25T15:22:42Z",
+                "body": "<!-- reviewer-bot:transition-warning:v1 issue=42 reviewer=alice anchor= -->\n\n⚠️ **Review Reminder**\n\nExisting warning",
+                "user": {"login": "guidelines-bot"},
+            }
+        ],
+        {},
+        "ok",
+        True,
+        None,
+        0,
+        None,
+    )
+    runtime.github.post_comment_result = lambda issue_number, body: pytest.fail("warning backfill must not repost")
+
+    assert maintenance.handle_overdue_review_warning(runtime, state, 42, "alice") is True
+    assert review["transition_warning_sent"] == "2026-03-25T15:22:42Z"
+
+
+def test_backfill_transition_notice_if_present_records_dedupe_failure_without_backfill(monkeypatch):
+    state = make_state()
+    review = review_state.ensure_review_entry(state, 42, create=True)
+    assert review is not None
+    review["current_reviewer"] = "alice"
+    review["transition_warning_sent"] = "2026-03-10T00:00:00Z"
+    runtime = FakeReviewerBotRuntime(monkeypatch)
+    runtime.github.list_issue_comments_result = lambda issue_number, page=1, per_page=100: runtime.GitHubApiResult(
+        502,
+        None,
+        {},
+        "bad gateway",
+        False,
+        "server_error",
+        1,
+        None,
+    )
+
+    assert maintenance.backfill_transition_notice_if_present(runtime, state, 42) is True
+    assert review.get("transition_notice_sent_at") is None
+    assert load_repair_marker(review, "transition_dedupe_read")["failure_kind"] == "server_error"
+
+
+def test_check_overdue_reviews_non_pr_contributor_followup_reanchors_to_contributor_timestamp(monkeypatch):
+    runtime = FakeReviewerBotRuntime(monkeypatch)
+    now = runtime.datetime.now(runtime.timezone.utc)
+    assigned_at = iso_z(now - timedelta(days=runtime.REVIEW_DEADLINE_DAYS + 20))
+    reviewer_comment_at = iso_z(now - timedelta(days=runtime.REVIEW_DEADLINE_DAYS + 19))
+    contributor_comment_at = iso_z(now - timedelta(days=runtime.REVIEW_DEADLINE_DAYS + 1))
+    state = make_state()
+    review = make_tracked_review_state(
+        state,
+        42,
+        reviewer="alice",
+        assigned_at=assigned_at,
+        active_cycle_started_at=assigned_at,
+    )
+    accept_reviewer_comment(
+        review,
+        semantic_key="issue_comment:10",
+        timestamp=reviewer_comment_at,
+        actor="alice",
+    )
+    accept_contributor_comment(
+        review,
+        semantic_key="issue_comment:11",
+        timestamp=contributor_comment_at,
+        actor="dana",
+    )
+    runtime.github.get_issue_or_pr_snapshot_result = lambda issue_number: runtime.GitHubApiResult(
+        200,
+        issue_snapshot(issue_number, state="open", is_pull_request=False),
+        {},
+        "ok",
+        True,
+        None,
+        0,
+        None,
+    )
+    runtime.github.get_issue_assignees_result = lambda issue_number, is_pull_request=None: runtime.GitHubApiResult(
+        200,
+        ["alice"],
+        {},
+        "ok",
+        True,
+        None,
+        0,
+        None,
+    )
+
+    overdue = maintenance.check_overdue_reviews(runtime, state)
+
+    assert overdue == [
+        {
+            "issue_number": 42,
+            "reviewer": "alice",
+            "days_overdue": 1,
+            "days_since_warning": 0,
+            "needs_warning": True,
+            "needs_transition": False,
+            "anchor_reason": "contributor_comment_newer",
+            "anchor_timestamp": contributor_comment_at,
+        }
+    ]
 
 
 def test_check_overdue_reviews_uses_contributor_comment_timestamp_when_turn_returns_to_reviewer(monkeypatch):
@@ -109,6 +353,16 @@ def test_check_overdue_reviews_uses_contributor_comment_timestamp_when_turn_retu
     accept_contributor_comment(review, semantic_key="issue_comment:20", timestamp=contributor_comment_at, actor="bob")
     routes = RouteGitHubApi().add_pull_request_snapshot(42, pull_request_payload(42, head_sha="head-1"))
     runtime = _runtime(monkeypatch, routes)
+    runtime.github.get_issue_assignees_result = lambda issue_number, is_pull_request=None: runtime.GitHubApiResult(
+        200,
+        ["alice"],
+        {},
+        "ok",
+        True,
+        None,
+        0,
+        None,
+    )
     monkeypatch.setattr(approval_policy, "compute_pr_approval_state_result", _approval_incomplete_result)
 
     overdue = maintenance.check_overdue_reviews(runtime, state)
@@ -129,6 +383,16 @@ def test_check_overdue_reviews_uses_contributor_revision_timestamp_when_head_cha
     accept_contributor_revision(review, semantic_key="pull_request_sync:42:head-2", timestamp=contributor_revision_at, actor="alice", head_sha="head-2")
     routes = RouteGitHubApi().add_pull_request_snapshot(42, pull_request_payload(42, head_sha="head-2")).add_pull_request_reviews(42, [])
     runtime = _runtime(monkeypatch, routes)
+    runtime.github.get_issue_assignees_result = lambda issue_number, is_pull_request=None: runtime.GitHubApiResult(
+        200,
+        ["alice"],
+        {},
+        "ok",
+        True,
+        None,
+        0,
+        None,
+    )
 
     overdue = maintenance.check_overdue_reviews(runtime, state)
     assert overdue[0]["issue_number"] == 42
