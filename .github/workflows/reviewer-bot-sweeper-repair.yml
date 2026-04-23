@@ -10,9 +10,9 @@ on:
         required: true
         default: check-overdue
         type: choice
-        options: [sync-members, show-state, check-overdue, repair-review-status-labels, preview-reviewer-board]
+        options: [sync-members, show-state, check-overdue, repair-review-status-labels]
       issue_number:
-        description: Optional issue or PR number for targeted reviewer-board preview
+        description: Optional issue or PR number for targeted actions
         required: false
         type: string
 

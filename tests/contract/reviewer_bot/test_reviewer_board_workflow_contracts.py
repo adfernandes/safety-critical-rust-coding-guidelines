@@ -7,17 +7,17 @@ pytestmark = pytest.mark.contract
 import yaml
 
 
-def test_sweeper_repair_workflow_exposes_reviewer_board_preview_dispatch():
+def test_sweeper_repair_workflow_removes_reviewer_board_preview_dispatch():
     data = yaml.safe_load(Path(".github/workflows/reviewer-bot-sweeper-repair.yml").read_text(encoding="utf-8"))
     on_block = data.get("on", data.get(True))
     workflow_dispatch = on_block["workflow_dispatch"]
     action_input = workflow_dispatch["inputs"]["action"]
-    assert "preview-reviewer-board" in action_input["options"]
+    assert "preview-reviewer-board" not in action_input["options"]
     issue_number_input = workflow_dispatch["inputs"]["issue_number"]
     assert issue_number_input["required"] is False
     assert issue_number_input["type"] == "string"
 
-def test_sweeper_repair_workflow_scopes_reviewer_board_env_to_preview_only():
+def test_sweeper_repair_workflow_retains_reviewer_board_env_wiring_without_dispatch_option():
     workflow_text = Path(".github/workflows/reviewer-bot-sweeper-repair.yml").read_text(encoding="utf-8")
     assert "ISSUE_NUMBER: ${{ github.event.inputs.issue_number }}" in workflow_text
     assert (
