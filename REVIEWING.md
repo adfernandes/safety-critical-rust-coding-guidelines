@@ -86,7 +86,6 @@ permission to persist reviewer-bot state.
 
 Who can run it:
 - The currently assigned reviewer
-- A maintainer with triage+ permission
 
 What it does (for the current PR only):
 - If the latest review by the assigned reviewer is `APPROVED`, it marks the review complete.

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from scripts.reviewer_bot_core import (
     comment_command_policy,
     comment_freshness_policy,
+    live_review_support,
     privileged_command_policy,
 )
 
@@ -133,6 +134,12 @@ def _build_execution_result(command_id: comment_command_policy.OrdinaryCommandId
 
 
 def _execute_pass(bot, state: dict, decision, assignment_request: AssignmentRequest | None) -> CommandExecutionResult:
+    reviewer_authority = assignment_flow.resolve_reviewer_command_authority(
+        bot,
+        state,
+        assignment_request,
+        actor=decision.actor,
+    )
     return _build_execution_result(
         decision.command_id,
         commands_module.handle_pass_command(
@@ -142,6 +149,7 @@ def _execute_pass(bot, state: dict, decision, assignment_request: AssignmentRequ
             decision.actor,
             " ".join(decision.raw_args) if decision.raw_args else None,
             request=assignment_request,
+            reviewer_authority=reviewer_authority,
         ),
     )
 
@@ -214,19 +222,126 @@ def _execute_claim(bot, state: dict, decision, assignment_request: AssignmentReq
 
 
 def _execute_release(bot, state: dict, decision, assignment_request: AssignmentRequest | None) -> CommandExecutionResult:
+    reviewer_authority = assignment_flow.resolve_reviewer_command_authority(
+        bot,
+        state,
+        assignment_request,
+        actor=decision.actor,
+    )
     return _build_execution_result(
         decision.command_id,
-        commands_module.handle_release_command(bot, state, decision.issue_number, decision.actor, list(decision.raw_args), request=assignment_request),
+        commands_module.handle_release_command(
+            bot,
+            state,
+            decision.issue_number,
+            decision.actor,
+            list(decision.raw_args),
+            request=assignment_request,
+            reviewer_authority=reviewer_authority,
+        ),
     )
 
 
-def _execute_rectify(bot, state: dict, decision, assignment_request: AssignmentRequest | None) -> CommandExecutionResult:
-    del assignment_request
+def _execute_rectify(bot, state: dict, request: CommentEventRequest, decision) -> CommandExecutionResult:
     from . import reconcile as reconcile_module
 
+    reviewer_authority = assignment_flow.resolve_reviewer_command_authority(
+        bot,
+        state,
+        request,
+        actor=decision.actor,
+    )
     return _build_execution_result(
         decision.command_id,
-        reconcile_module.handle_rectify_command(bot, state, decision.issue_number, decision.actor),
+        reconcile_module.handle_rectify_command(
+            bot,
+            state,
+            decision.issue_number,
+            decision.actor,
+            reviewer_authority=reviewer_authority,
+        ),
+    )
+
+
+def _handoff_order_key(handoff: dict) -> tuple[object, str] | None:
+    timestamp = live_review_support.parse_github_timestamp(handoff.get("timestamp"))
+    if timestamp is None:
+        return None
+    source_event_key = handoff.get("source_event_key")
+    return timestamp, source_event_key if isinstance(source_event_key, str) else ""
+
+
+def _feedback_handoff_should_replace(existing: object, candidate: dict) -> bool:
+    if not isinstance(existing, dict):
+        return True
+    candidate_key = _handoff_order_key(candidate)
+    existing_key = _handoff_order_key(existing)
+    if candidate_key is None:
+        return existing_key is None
+    if existing_key is None:
+        return True
+    candidate_timestamp, candidate_source = candidate_key
+    existing_timestamp, existing_source = existing_key
+    if candidate_timestamp > existing_timestamp:
+        return True
+    if candidate_timestamp < existing_timestamp:
+        return False
+    return candidate_source == existing_source
+
+
+def handle_feedback_command(bot, state: dict, request: CommentEventRequest, decision) -> CommandExecutionResult:
+    if request.issue_state.lower() != "open":
+        return CommandExecutionResult(
+            response="❌ `/feedback` can only be used on open tracked review items.",
+            success=False,
+            state_changed=False,
+        )
+    authority = assignment_flow.resolve_reviewer_command_authority(
+        bot,
+        state,
+        request,
+        actor=decision.actor,
+    )
+    if not authority.get("authorized"):
+        return CommandExecutionResult(
+            response=assignment_flow.reviewer_command_authority_failure_message("feedback", authority),
+            success=False,
+            state_changed=False,
+        )
+    review_data = authority.get("review_data")
+    if not isinstance(review_data, dict):
+        return CommandExecutionResult(response="❌ Unable to load review state.", success=False, state_changed=False)
+    reviewed_head_sha = None
+    if request.is_pull_request:
+        active_head_sha = review_data.get("active_head_sha")
+        if not isinstance(active_head_sha, str) or not active_head_sha.strip():
+            return CommandExecutionResult(
+                response="❌ Unable to record `/feedback`: tracked PR head is unavailable.",
+                success=False,
+                state_changed=False,
+            )
+        reviewed_head_sha = active_head_sha
+    handoff = {
+        "source_event_key": request.comment_source_event_key or f"issue_comment:{request.comment_id}",
+        "timestamp": request.comment_created_at,
+        "actor": decision.actor,
+        "command_name": comment_command_policy.OrdinaryCommandId.FEEDBACK.value,
+        "reviewed_head_sha": reviewed_head_sha,
+    }
+    before = review_data.get("current_cycle_reviewer_handoff")
+    if not _feedback_handoff_should_replace(before, handoff):
+        return CommandExecutionResult(
+            response="ℹ️ Ignored stale `/feedback` handoff because a newer or same-time reviewer handoff is already recorded.",
+            success=True,
+            state_changed=False,
+        )
+    review_data["current_cycle_reviewer_handoff"] = handoff
+    activity_changed = record_reviewer_activity(review_data, request.comment_created_at)
+    state_changed = before != handoff or activity_changed
+    return CommandExecutionResult(
+        response="✅ Recorded reviewer feedback handoff. Reviewer-bot is now waiting on contributor response.",
+        success=True,
+        state_changed=state_changed,
     )
 
 
@@ -243,6 +358,13 @@ def _execute_assign_from_queue(bot, state: dict, decision, assignment_request: A
         decision.command_id,
         commands_module.handle_assign_from_queue_command(bot, state, decision.issue_number, request=assignment_request),
     )
+
+
+def _command_skips_freshness_recording(classified: dict) -> bool:
+    return classified.get("command") in {
+        comment_command_policy.OrdinaryCommandId.FEEDBACK.value,
+        "_malformed_feedback_args",
+    }
 
 
 ORDINARY_COMMAND_HANDLERS = {
@@ -281,11 +403,11 @@ def apply_comment_command(
         return False
 
     issue_number = request.issue_number
-    review_data = ensure_review_entry(state, issue_number, create=True)
-    if review_data is None:
-        return False
     source_event_key = request.comment_source_event_key or f"issue_comment:{request.comment_id}"
     if isinstance(decision, comment_command_policy.DeferPrivilegedHandoffDecision):
+        review_data = ensure_review_entry(state, issue_number, create=True)
+        if review_data is None:
+            return False
         permission_status = bot.github.get_user_permission_status(request.comment_author, "triage")
         handoff = privileged_command_policy.validate_accept_no_fls_changes_handoff(
             request,
@@ -314,12 +436,17 @@ def apply_comment_command(
         execution = CommandExecutionResult(response=decision.response, success=decision.success, state_changed=False)
         react = decision.react
     else:
-        assignment_request = (
-            _build_assignment_request_from_comment_request(request)
-            if decision.needs_assignment_request
-            else None
-        )
-        execution = ORDINARY_COMMAND_HANDLERS[decision.command_id](bot, state, decision, assignment_request)
+        if decision.command_id == comment_command_policy.OrdinaryCommandId.FEEDBACK:
+            execution = handle_feedback_command(bot, state, request, decision)
+        elif decision.command_id == comment_command_policy.OrdinaryCommandId.RECTIFY:
+            execution = _execute_rectify(bot, state, request, decision)
+        else:
+            assignment_request = (
+                _build_assignment_request_from_comment_request(request)
+                if decision.needs_assignment_request
+                else None
+            )
+            execution = ORDINARY_COMMAND_HANDLERS[decision.command_id](bot, state, decision, assignment_request)
         react = True
 
     comment_id = request.comment_id
@@ -344,7 +471,7 @@ def process_comment_event(
     classified = classify_comment_payload(bot, request.comment_body)
     routing = _route_comment_application(classified, comment_id=comment_id)
     state_changed = False
-    if routing in {"freshness_only", "both"}:
+    if routing in {"freshness_only", "both"} and not _command_skips_freshness_recording(classified):
         state_changed = record_conversation_freshness(bot, state, request) or state_changed
     if routing in {"command_only", "both"}:
         state_changed = apply_comment_command(

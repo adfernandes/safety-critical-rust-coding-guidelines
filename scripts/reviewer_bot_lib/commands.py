@@ -84,6 +84,8 @@ def parse_command(bot, comment_body: str) -> tuple[str, list[str]] | None:
             username = target.lstrip("@")
             return "r?-user", [f"@{username}"]
         return "r?", []
+    if command == "feedback" and args_str:
+        return "_malformed_feedback_args", []
     args = []
     if args_str:
         current_arg = ""
@@ -154,6 +156,10 @@ def _single_current_assignee_or_error(current_assignees: list[str]) -> tuple[str
     return current_assignees[0], None
 
 
+def _reviewer_command_authority_error(command_name: str, resolution: dict[str, object]) -> str:
+    return assignment_flow.reviewer_command_authority_failure_message(command_name, resolution)
+
+
 def handle_pass_command(
     bot,
     state: dict,
@@ -161,19 +167,23 @@ def handle_pass_command(
     comment_author: str,
     reason: str | None,
     request: AssignmentRequest | None = None,
+    reviewer_authority: dict[str, object] | None = None,
 ) -> tuple[str, bool]:
     assignment_request = request or build_assignment_request(bot, issue_number=issue_number)
-    issue_data = review_state.ensure_review_entry(state, issue_number, create=True)
-    if issue_data is None:
+    authority = reviewer_authority or assignment_flow.resolve_reviewer_command_authority(
+        bot,
+        state,
+        assignment_request,
+        actor=comment_author,
+    )
+    authority = assignment_flow.require_reviewer_command_actor(authority, comment_author)
+    if not authority.get("authorized"):
+        return _reviewer_command_authority_error("pass", authority), False
+    issue_data = authority.get("review_data")
+    if not isinstance(issue_data, dict):
         return "❌ Unable to load review state.", False
-    current_assignees, assignee_error = _current_assignees_or_error(bot, issue_number)
-    if assignee_error:
-        return assignee_error, False
-    passed_reviewer, reviewer_error = _single_current_assignee_or_error(current_assignees)
-    if reviewer_error:
-        return reviewer_error, False
-    if passed_reviewer.lower() != comment_author.lower():
-        return "❌ Only the currently assigned reviewer can use `/pass`.", False
+    passed_reviewer = str(authority["tracked_reviewer"])
+    current_assignees = list(authority.get("live_control_plane_reviewers") or [])
     skipped = list(issue_data["skipped"])
     is_first_pass = len(skipped) == 0
     if passed_reviewer not in skipped:
@@ -417,7 +427,7 @@ def handle_queue_command(
 
 
 def handle_commands_command(bot) -> tuple[str, bool]:
-    return (f"ℹ️ **Available Commands**\n\n**Pass or step away:**\n- `{bot.BOT_MENTION} /pass [reason]` - Pass this review to next in queue (current reviewer only)\n- `{bot.BOT_MENTION} /away YYYY-MM-DD [reason]` - Step away from queue until a date\n- `{bot.BOT_MENTION} /release [@username] [reason]` - Release assignment (yours or someone else's with triage+ permission)\n\n**Assign reviewers:**\n- `{bot.BOT_MENTION} /r? @username` - Assign a specific reviewer\n- `{bot.BOT_MENTION} /r? producers` - Request the next reviewer from the queue\n- `{bot.BOT_MENTION} /claim` - Claim this review for yourself\n\n**Other:**\n- `{bot.BOT_MENTION} /done` - Mark a tracked non-PR issue review complete\n- `{bot.BOT_MENTION} /label +label-name` - Add a label\n- `{bot.BOT_MENTION} /label -label-name` - Remove a label\n- `{bot.BOT_MENTION} /rectify` - Reconcile this issue/PR review state from GitHub\n- `{bot.BOT_MENTION} /accept-no-fls-changes` - Update spec.lock and open a PR when no guidelines are impacted\n- `{bot.BOT_MENTION} /queue` - Show current queue status\n- `{bot.BOT_MENTION} /sync-members` - Sync queue with members.md"), True
+    return (f"ℹ️ **Available Commands**\n\n**Pass or step away:**\n- `{bot.BOT_MENTION} /pass [reason]` - Pass this review to next in queue (current reviewer only)\n- `{bot.BOT_MENTION} /away YYYY-MM-DD [reason]` - Step away from queue until a date\n- `{bot.BOT_MENTION} /feedback` - Mark reviewer feedback ready for contributor follow-up\n- `{bot.BOT_MENTION} /release [reason]` - Release your current reviewer assignment\n\n**Assign reviewers:**\n- `{bot.BOT_MENTION} /r? @username` - Assign a specific reviewer\n- `{bot.BOT_MENTION} /r? producers` - Request the next reviewer from the queue\n- `{bot.BOT_MENTION} /claim` - Claim this review for yourself\n\n**Other:**\n- `{bot.BOT_MENTION} /done` - Mark a tracked non-PR issue review complete\n- `{bot.BOT_MENTION} /label +label-name` - Add a label\n- `{bot.BOT_MENTION} /label -label-name` - Remove a label\n- `{bot.BOT_MENTION} /rectify` - Reconcile this issue/PR review state from GitHub (current reviewer only)\n- `{bot.BOT_MENTION} /accept-no-fls-changes` - Update spec.lock and open a PR when no guidelines are impacted\n- `{bot.BOT_MENTION} /queue` - Show current queue status\n- `{bot.BOT_MENTION} /sync-members` - Sync queue with members.md"), True
 
 
 def handle_claim_command(
@@ -460,49 +470,36 @@ def handle_release_command(
     comment_author: str,
     args: list | None = None,
     request: AssignmentRequest | None = None,
+    reviewer_authority: dict[str, object] | None = None,
 ) -> tuple[str, bool]:
     args = args or []
     request = request or build_assignment_request(bot, issue_number=issue_number)
     target_username = None
     reason = None
-    releasing_other = False
     if args and args[0].startswith("@"):
         target_username = args[0].lstrip("@")
         reason = " ".join(args[1:]) if len(args) > 1 else None
-        releasing_other = target_username.lower() != comment_author.lower()
-        permission_status = bot.github.get_user_permission_status(comment_author, "triage")
-        if permission_status == "unavailable":
-            return "❌ Unable to verify triage permissions right now; refusing to continue.", False
-        if releasing_other and permission_status != "granted":
-            return (f"❌ @{comment_author} does not have permission to release other reviewers. Triage access or higher is required."), False
     else:
         target_username = comment_author
         reason = " ".join(args) if args else None
     issue_key = str(issue_number)
-    tracked_reviewer = None
     assignment_method = None
     if "active_reviews" in state and issue_key in state["active_reviews"]:
         issue_data = state["active_reviews"][issue_key]
         if isinstance(issue_data, dict):
-            tracked_reviewer = issue_data.get("current_reviewer")
             assignment_method = issue_data.get("assignment_method")
-    current_assignees, assignee_error = _current_assignees_or_error(bot, issue_number)
-    if assignee_error:
-        return assignee_error, False
-    is_tracked = tracked_reviewer and tracked_reviewer.lower() == target_username.lower()
-    is_assigned = target_username.lower() in [assignee.lower() for assignee in current_assignees]
-    if not is_tracked and not is_assigned:
-        if releasing_other:
-            if tracked_reviewer:
-                return (f"❌ @{target_username} is not the current reviewer. Current reviewer: @{tracked_reviewer}"), False
-            if current_assignees:
-                return (f"❌ @{target_username} is not assigned to this issue/PR. Current assignee(s): @{', @'.join(current_assignees)}"), False
-            return f"❌ @{target_username} is not assigned to this issue/PR.", False
-        if tracked_reviewer:
-            return (f"❌ @{comment_author} is not the current reviewer. Current reviewer: @{tracked_reviewer}"), False
-        if current_assignees:
-            return (f"❌ @{comment_author} is not assigned to this issue/PR. Current assignee(s): @{', @'.join(current_assignees)}"), False
-            return "❌ No reviewer is currently assigned to release.", False
+    authority = reviewer_authority or assignment_flow.resolve_reviewer_command_authority(
+        bot,
+        state,
+        request,
+        actor=comment_author,
+    )
+    authority = assignment_flow.require_reviewer_command_actor(authority, comment_author)
+    if not authority.get("authorized"):
+        return _reviewer_command_authority_error("release", authority), False
+    tracked_reviewer = str(authority["tracked_reviewer"])
+    if target_username.lower() != tracked_reviewer.lower():
+        return (f"❌ @{target_username} is not the current reviewer. Current reviewer: @{tracked_reviewer}"), False
     result = assignment_flow.confirm_reviewer_release(
         bot,
         state,
@@ -515,8 +512,6 @@ def handle_release_command(
             result.get("diagnostic_changed") or result.get("cleared_current_reviewer")
         )
     reason_text = f" Reason: {reason}" if reason else ""
-    if releasing_other:
-        return (f"✅ @{comment_author} has released @{target_username} from this review.{reason_text}\n\n_This issue/PR is now unassigned. Use `{bot.BOT_MENTION} /r? producers` to assign the next reviewer from the queue, or `{bot.BOT_MENTION} /claim` to claim it._"), True
     return (f"✅ @{target_username} has released this review.{reason_text}\n\n_This issue/PR is now unassigned. Use `{bot.BOT_MENTION} /r? producers` to assign the next reviewer from the queue, or `{bot.BOT_MENTION} /claim` to claim it._"), True
 
 

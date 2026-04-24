@@ -61,6 +61,13 @@ def test_review_entry_adapter_round_trips_full_current_mutation_shape():
             "reviewer": "bob",
         },
         "current_cycle_write_approval": {"approved": False},
+        "current_cycle_reviewer_handoff": {
+            "source_event_key": "issue_comment:13",
+            "timestamp": "2026-03-20T04:00:00Z",
+            "actor": "bob",
+            "command_name": "feedback",
+            "reviewed_head_sha": "head-1",
+        },
     }
 
     adapted = state_adapters.review_entry_from_persisted(persisted)
@@ -100,7 +107,35 @@ def test_review_entry_adapter_matches_current_sparse_upgrade_semantics():
         "review_dismissal": {"accepted": None, "seen_keys": []},
         "current_cycle_completion": {},
         "current_cycle_write_approval": {},
+        "current_cycle_reviewer_handoff": None,
     }
+
+
+def test_review_entry_adapter_drops_malformed_reviewer_handoff_shapes():
+    valid = {
+        "source_event_key": "issue_comment:13",
+        "timestamp": "2026-03-20T04:00:00Z",
+        "actor": "bob",
+        "command_name": "feedback",
+        "reviewed_head_sha": "head-1",
+    }
+    malformed_payloads = [
+        {**valid, "unexpected": "value"},
+        {key: value for key, value in valid.items() if key != "actor"},
+        {**valid, "source_event_key": ""},
+        {**valid, "timestamp": None},
+        {**valid, "actor": ""},
+        {**valid, "command_name": "pass"},
+        {**valid, "reviewed_head_sha": 42},
+    ]
+
+    for malformed in malformed_payloads:
+        adapted = state_adapters.review_entry_from_persisted(
+            {"current_cycle_reviewer_handoff": malformed}
+        )
+
+        assert adapted is not None
+        assert state_adapters.review_entry_to_persisted(adapted)["current_cycle_reviewer_handoff"] is None
 
 
 def test_review_entry_adapter_returns_none_for_unusable_persisted_shape():

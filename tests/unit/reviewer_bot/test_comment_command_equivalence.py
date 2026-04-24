@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 from scripts.reviewer_bot_core import comment_command_policy, privileged_command_policy
-from scripts.reviewer_bot_lib import commands, comment_application
+from scripts.reviewer_bot_lib import commands, comment_application, review_state
 from scripts.reviewer_bot_lib import config as config_module
 from tests.fixtures.commands_harness import CommandHarness
 from tests.fixtures.reviewer_bot import make_state
@@ -11,6 +11,7 @@ from tests.fixtures.reviewer_bot_recorders import record_comment_side_effects
 C3B2_DELETION_MANIFEST = [
     "pass",
     "away",
+    "feedback",
     "label",
     "sync-members",
     "queue",
@@ -24,6 +25,7 @@ C3B2_DELETION_MANIFEST = [
     "_multiple_commands",
     "_malformed_known",
     "_malformed_unknown",
+    "_malformed_feedback_args",
     "unknown_command",
 ]
 
@@ -49,9 +51,6 @@ def _legacy_decide_comment_command(bot, request, classified, *, actor_class: str
 
 def _legacy_apply_ordinary_decision(bot, state: dict, request, decision: dict) -> bool:
     issue_number = request.issue_number
-    review_data = comment_application.ensure_review_entry(state, issue_number, create=True)
-    if review_data is None:
-        return False
     assignment_request = comment_application._build_assignment_request_from_comment_request(request)
     if decision["kind"] == "execute_ordinary_command":
         typed_decision = comment_command_policy.ExecuteOrdinaryCommandDecision(
@@ -61,7 +60,10 @@ def _legacy_apply_ordinary_decision(bot, state: dict, request, decision: dict) -
             raw_args=tuple(decision["raw_args"]),
             needs_assignment_request=decision["needs_assignment_request"],
         )
-        execution = comment_application.ORDINARY_COMMAND_HANDLERS[decision["command_id"]](bot, state, typed_decision, assignment_request if decision["needs_assignment_request"] else None)
+        if decision["command_id"] == comment_command_policy.OrdinaryCommandId.FEEDBACK:
+            execution = comment_application.handle_feedback_command(bot, state, request, typed_decision)
+        else:
+            execution = comment_application.ORDINARY_COMMAND_HANDLERS[decision["command_id"]](bot, state, typed_decision, assignment_request if decision["needs_assignment_request"] else None)
         response = execution.response
         success = execution.success
         state_changed = execution.state_changed
@@ -110,6 +112,8 @@ def test_comment_command_fixture_declares_ordinary_scope_and_deferred_privileged
     assert fixture["deferred_command_set"] == ["accept-no-fls-changes"]
     assert fixture["equivalence_scenarios"] == [
         "queue_success",
+        "feedback_success",
+        "feedback_malformed_args",
         "label_triplet_handler",
         "away_missing_date",
         "multiple_commands_warning",
@@ -171,7 +175,7 @@ def test_i1_comment_policy_types_ordinary_command_output_shape(monkeypatch):
 def test_i2_comment_application_routing_does_not_reopen_command_semantics_in_adapter():
     module_text = Path("scripts/reviewer_bot_lib/comment_application.py").read_text(encoding="utf-8")
 
-    assert 'if routing in {"freshness_only", "both"}:' in module_text
+    assert 'if routing in {"freshness_only", "both"} and not _command_skips_freshness_recording(classified):' in module_text
     assert 'if routing in {"command_only", "both"}:' in module_text
     assert "if command == " not in module_text
 
@@ -194,6 +198,28 @@ def test_command_decision_equivalence_matches_legacy_for_ordinary_paths(monkeypa
                 issue_number=42,
                 actor="alice",
                 body="@guidelines-bot /queue",
+                issue_author="dana",
+                is_pull_request=False,
+            ),
+        ),
+        (
+            "feedback_success",
+            {"command": "feedback", "args": [], "command_count": 1},
+            CommandHarness(monkeypatch).typed_comment_request(
+                issue_number=42,
+                actor="alice",
+                body="@guidelines-bot /feedback",
+                issue_author="dana",
+                is_pull_request=False,
+            ),
+        ),
+        (
+            "feedback_malformed_args",
+            {"command": "_malformed_feedback_args", "args": [], "command_count": 1},
+            CommandHarness(monkeypatch).typed_comment_request(
+                issue_number=42,
+                actor="alice",
+                body="@guidelines-bot /feedback please",
                 issue_author="dana",
                 is_pull_request=False,
             ),
@@ -252,6 +278,12 @@ def test_command_decision_equivalence_matches_legacy_for_ordinary_paths(monkeypa
         new_harness = CommandHarness(monkeypatch)
         old_state = make_state()
         new_state = make_state()
+        if scenario_name == "feedback_success":
+            for harness, state in ((old_harness, old_state), (new_harness, new_state)):
+                review = review_state.ensure_review_entry(state, 42, create=True)
+                assert review is not None
+                review["current_reviewer"] = "alice"
+                harness.stub_assignees(["alice"])
         old_effects = record_comment_side_effects(old_harness.runtime)
         old_decision = _legacy_decide_comment_command(
             old_harness.runtime,

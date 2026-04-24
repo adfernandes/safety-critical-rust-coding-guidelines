@@ -73,6 +73,7 @@ def test_ensure_review_entry_initializes_tracked_review_shape():
     assert review["sidecars"]["observer_discovery_watermarks"] == {}
     assert review["sidecars"]["reconciled_source_events"] == {}
     assert review["current_cycle_write_approval"] == {}
+    assert review["current_cycle_reviewer_handoff"] is None
 
 
 def test_state_contract_table_fixture_lists_frozen_sections_and_field_classifications():
@@ -94,6 +95,7 @@ def test_state_contract_table_fixture_lists_frozen_sections_and_field_classifica
         "- pending_privileged_commands: nested under sidecars",
         "- deferred_gaps: nested under sidecars",
         "- current_cycle_write_approval: lazily materialized",
+        "- current_cycle_reviewer_handoff: lazily materialized",
         "- observer_discovery_watermarks: nested under sidecars",
         "- reconciled_source_events: nested under sidecars as a map; tolerated legacy list shape",
         "- accepted: lazily materialized",
@@ -137,6 +139,7 @@ def test_ensure_review_entry_repairs_missing_nested_maps_and_legacy_list_fields(
     assert review["sidecars"]["repair_markers"] == _expected_repair_markers()
     assert review["current_cycle_completion"] == {}
     assert review["current_cycle_write_approval"] == {}
+    assert review["current_cycle_reviewer_handoff"] is None
     assert review["sidecars"]["reconciled_source_events"] == {}
 
 
@@ -172,6 +175,7 @@ def test_review_state_mutation_inventory_freezes_overlap_classification_and_live
         "- set_current_reviewer: local-state-only mutation",
         "- update_reviewer_activity: local-state-only mutation",
         "- mark_review_complete: local-state-only mutation",
+        "- clear_current_cycle_reviewer_handoff: local-state-only mutation",
         "- get_current_cycle_boundary: read-only helper",
         "- clear_transition_timers: local-state-only mutation",
         "- semantic_key_seen: read-only helper",
@@ -220,6 +224,108 @@ def test_mark_review_complete_updates_completion_fields():
     assert review["current_cycle_completion"]["completed"] is True
 
 
+def test_current_cycle_reviewer_handoff_is_cleared_by_reviewer_replacement_and_release():
+    state = make_state()
+    review = review_state.ensure_review_entry(state, 42, create=True)
+    assert review is not None
+    review["current_reviewer"] = "alice"
+    review["current_cycle_reviewer_handoff"] = {
+        "source_event_key": "issue_comment:100",
+        "timestamp": "2026-03-17T10:00:00Z",
+        "actor": "alice",
+        "command_name": "feedback",
+        "reviewed_head_sha": None,
+    }
+
+    review_state.set_current_reviewer(state, 42, "bob", at="2026-03-17T11:00:00Z")
+
+    assert review["current_cycle_reviewer_handoff"] is None
+    review["current_cycle_reviewer_handoff"] = {
+        "source_event_key": "issue_comment:101",
+        "timestamp": "2026-03-17T12:00:00Z",
+        "actor": "bob",
+        "command_name": "feedback",
+        "reviewed_head_sha": None,
+    }
+
+    assert review_state.clear_current_reviewer(state, 42) is True
+    assert review["current_cycle_reviewer_handoff"] is None
+
+
+def test_current_cycle_reviewer_handoff_is_cleared_by_newer_contributor_followup():
+    state = make_state()
+    review = review_state.ensure_review_entry(state, 42, create=True)
+    assert review is not None
+    review["current_cycle_reviewer_handoff"] = {
+        "source_event_key": "issue_comment:100",
+        "timestamp": "2026-03-17T10:00:00Z",
+        "actor": "alice",
+        "command_name": "feedback",
+        "reviewed_head_sha": None,
+    }
+
+    changed = review_state.accept_channel_event(
+        review,
+        "contributor_comment",
+        semantic_key="issue_comment:101",
+        timestamp="2026-03-17T11:00:00Z",
+        actor="dana",
+    )
+
+    assert changed is True
+    assert review["current_cycle_reviewer_handoff"] is None
+
+
+def test_current_cycle_reviewer_handoff_survives_older_contributor_followup():
+    state = make_state()
+    review = review_state.ensure_review_entry(state, 42, create=True)
+    assert review is not None
+    handoff = {
+        "source_event_key": "issue_comment:100",
+        "timestamp": "2026-03-17T10:00:00Z",
+        "actor": "alice",
+        "command_name": "feedback",
+        "reviewed_head_sha": None,
+    }
+    review["current_cycle_reviewer_handoff"] = dict(handoff)
+
+    changed = review_state.accept_channel_event(
+        review,
+        "contributor_comment",
+        semantic_key="issue_comment:99",
+        timestamp="2026-03-17T09:00:00Z",
+        actor="dana",
+    )
+
+    assert changed is True
+    assert review["current_cycle_reviewer_handoff"] == handoff
+
+
+def test_current_cycle_reviewer_handoff_is_cleared_by_newer_contributor_revision():
+    state = make_state()
+    review = review_state.ensure_review_entry(state, 42, create=True)
+    assert review is not None
+    review["current_cycle_reviewer_handoff"] = {
+        "source_event_key": "issue_comment:100",
+        "timestamp": "2026-03-17T10:00:00Z",
+        "actor": "alice",
+        "command_name": "feedback",
+        "reviewed_head_sha": "head-1",
+    }
+
+    changed = review_state.accept_channel_event(
+        review,
+        "contributor_revision",
+        semantic_key="pull_request_sync:42:head-2",
+        timestamp="2026-03-17T11:00:00Z",
+        reviewed_head_sha="head-2",
+        source_precedence=1,
+    )
+
+    assert changed is True
+    assert review["current_cycle_reviewer_handoff"] is None
+
+
 def test_list_open_tracked_review_items_returns_only_assigned_entries():
     state = make_state()
     review_state.ensure_review_entry(state, 42, create=True)
@@ -238,6 +344,7 @@ def test_review_state_module_exposes_named_mutation_surface():
         "set_current_reviewer",
         "update_reviewer_activity",
         "mark_review_complete",
+        "clear_current_cycle_reviewer_handoff",
         "get_current_cycle_boundary",
         ]:
         assert hasattr(review_state, name)

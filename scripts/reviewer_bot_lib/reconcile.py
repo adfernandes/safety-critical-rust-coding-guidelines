@@ -10,6 +10,7 @@ from scripts.reviewer_bot_core.comment_routing_policy import (
     ObserverCommentClassification,
 )
 
+from . import assignment_flow
 from . import deferred_gap_bookkeeping as gap_bookkeeping
 from . import reconcile_payloads as _reconcile_payloads
 from .comment_application import (
@@ -187,48 +188,30 @@ def handle_rectify_command(
     state: dict,
     issue_number: int,
     comment_author: str,
+    reviewer_authority: dict[str, object] | None = None,
 ) -> tuple[str, bool, bool]:
-    current_assignees = bot.github.get_issue_assignees(issue_number)
-    if current_assignees is None:
-        return (
-            "❌ Unable to determine current assignees/reviewers from GitHub; refusing to continue.",
-            False,
-            False,
-        )
-    current_reviewer = current_assignees[0] if len(current_assignees) == 1 else None
-
-    is_current_reviewer = (
-        isinstance(current_reviewer, str)
-        and current_reviewer.lower() == comment_author.lower()
+    request = type(
+        "RectifyReviewerAuthorityRequest",
+        (),
+        {
+            "issue_number": issue_number,
+            "is_pull_request": bot.get_config_value("IS_PULL_REQUEST", "false").lower() == "true",
+        },
+    )()
+    reviewer_authority = reviewer_authority or assignment_flow.resolve_reviewer_command_authority(
+        bot,
+        state,
+        request,
+        actor=comment_author,
     )
-
-    triage_status = "denied"
-    if not is_current_reviewer:
-        triage_status = bot.github.get_user_permission_status(comment_author, "triage")
-
-    if not is_current_reviewer and triage_status == "unavailable":
-        return (
-            "❌ Unable to verify triage permissions right now; refusing to continue.",
-            False,
-            False,
-        )
-
-    if not is_current_reviewer and triage_status != "granted":
-        if current_reviewer:
-            return (
-                f"❌ Only the assigned reviewer (@{current_reviewer}) or a maintainer with triage+ "
-                "permission can run `/rectify`.",
-                False,
-                False,
-            )
-        return (
-            "❌ Only maintainers with triage+ permission can run `/rectify` when no confirmed assigned "
-            "reviewer is tracked.",
-            False,
-            False,
-        )
-
-    return reconcile_active_review_entry(bot, state, issue_number)
+    reviewer_authority = assignment_flow.require_reviewer_command_actor(reviewer_authority, comment_author)
+    if reviewer_authority.get("authorized"):
+        return reconcile_active_review_entry(bot, state, issue_number)
+    return (
+        assignment_flow.reviewer_command_authority_failure_message("rectify", reviewer_authority),
+        False,
+        False,
+    )
 
 
 def _load_deferred_context(bot: ReconcileWorkflowRuntimeContext) -> dict:

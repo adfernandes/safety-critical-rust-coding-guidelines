@@ -97,6 +97,18 @@ def _compare_records(left: dict | None, right: dict | None) -> int:
     return 0
 
 
+def _clear_handoff_after_newer_contributor_event(review_data: dict, timestamp: str) -> bool:
+    handoff = review_data.get("current_cycle_reviewer_handoff")
+    if not isinstance(handoff, dict):
+        return False
+    contributor_time = parse_github_timestamp(timestamp)
+    handoff_time = parse_github_timestamp(handoff.get("timestamp"))
+    if contributor_time is None or handoff_time is None or contributor_time <= handoff_time:
+        return False
+    review_data["current_cycle_reviewer_handoff"] = None
+    return True
+
+
 def semantic_key_seen(review_data: dict, channel_name: str, semantic_key: str) -> bool:
     channel = _ensure_channel_map(review_data, channel_name)
     return semantic_key in channel["seen_keys"]
@@ -135,6 +147,8 @@ def accept_channel_event(
     current = channel.get("accepted")
     if _compare_records(candidate, current) >= 0:
         channel["accepted"] = candidate
+    if channel_name in {"contributor_comment", "contributor_revision"}:
+        _clear_handoff_after_newer_contributor_event(review_data, timestamp)
     return True
 
 
@@ -161,7 +175,15 @@ def _reset_cycle_state(review_data: dict) -> None:
         review_data[channel] = {"accepted": None, "seen_keys": []}
     review_data["current_cycle_completion"] = {}
     review_data["current_cycle_write_approval"] = {}
+    review_data["current_cycle_reviewer_handoff"] = None
     review_data["overdue_anchor"] = None
+
+
+def clear_current_cycle_reviewer_handoff(review_data: dict) -> bool:
+    if review_data.get("current_cycle_reviewer_handoff") is None:
+        return False
+    review_data["current_cycle_reviewer_handoff"] = None
+    return True
 
 
 def set_current_reviewer(
@@ -204,6 +226,7 @@ def clear_current_reviewer(state: dict, issue_number: int) -> bool:
     if review_data.get("assignment_method") is not None:
         review_data["assignment_method"] = None
         changed = True
+    changed = clear_current_cycle_reviewer_handoff(review_data) or changed
     clear_transition_timers(review_data)
     return changed
 

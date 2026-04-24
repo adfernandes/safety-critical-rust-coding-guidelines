@@ -195,6 +195,50 @@ def _record_for_current_reviewer(record: dict | None | object, current_reviewer:
     return record
 
 
+def _current_cycle_reviewer_handoff_record(
+    review_data: dict,
+    current_reviewer: str,
+    current_head: str | None,
+    *,
+    issue_is_pull_request: bool,
+) -> dict | None:
+    handoff = review_data.get("current_cycle_reviewer_handoff")
+    if not isinstance(handoff, dict):
+        return None
+    if handoff.get("command_name") != "feedback":
+        return None
+    actor = handoff.get("actor")
+    timestamp = handoff.get("timestamp")
+    source_event_key = handoff.get("source_event_key")
+    if not isinstance(actor, str) or actor.lower() != current_reviewer.lower():
+        return None
+    if not isinstance(timestamp, str) or not timestamp.strip():
+        return None
+    if not isinstance(source_event_key, str) or not source_event_key.strip():
+        return None
+    handoff_time = live_review_support.parse_github_timestamp(timestamp)
+    if handoff_time is None:
+        return None
+    _, cycle_boundary = _initial_cycle_boundary(review_data)
+    cycle_boundary_time = live_review_support.parse_github_timestamp(cycle_boundary)
+    if cycle_boundary_time is not None and handoff_time < cycle_boundary_time:
+        return None
+    reviewed_head_sha = handoff.get("reviewed_head_sha")
+    if issue_is_pull_request:
+        if not isinstance(reviewed_head_sha, str) or reviewed_head_sha != current_head:
+            return None
+    elif reviewed_head_sha is not None:
+        return None
+    return {
+        "semantic_key": source_event_key,
+        "timestamp": timestamp,
+        "actor": actor,
+        "reviewed_head_sha": reviewed_head_sha,
+        "source_precedence": 1,
+        "payload": {"command_name": "feedback"},
+    }
+
+
 def _contributor_revision_handoff_record(review_data: dict, current_head: str | None, reviewer_review: dict | None) -> dict | None:
     contributor_revision = review_data.get("contributor_revision", {}).get("accepted")
     if not isinstance(contributor_revision, dict):
@@ -283,6 +327,52 @@ def derive_reviewer_response_state(
             parse_timestamp=live_review_support.parse_github_timestamp,
         ) > 0:
             latest_reviewer_response = reviewer_review
+        reviewer_handoff = _current_cycle_reviewer_handoff_record(
+            review_data,
+            current_reviewer,
+            None,
+            issue_is_pull_request=False,
+        )
+        if _compare_cross_channel_conversation(
+            contributor_comment,
+            reviewer_handoff,
+            parse_timestamp=live_review_support.parse_github_timestamp,
+        ) > 0:
+            reviewer_handoff = None
+        if reviewer_review_helpers.compare_records(
+            reviewer_handoff,
+            latest_reviewer_response,
+            parse_timestamp=live_review_support.parse_github_timestamp,
+        ) > 0:
+            latest_reviewer_response = reviewer_handoff
+        if reviewer_handoff is not None and latest_reviewer_response is reviewer_handoff:
+            if _compare_cross_channel_conversation(
+                contributor_comment,
+                reviewer_handoff,
+                parse_timestamp=live_review_support.parse_github_timestamp,
+            ) > 0:
+                return _decorate_response(
+                    state="awaiting_reviewer_response",
+                    reason="contributor_comment_newer",
+                    scope_fields=_current_scope_fields(review_data, current_reviewer, None, contributor_comment),
+                    anchor_timestamp=contributor_comment.get("timestamp") if isinstance(contributor_comment, dict) else None,
+                    reviewer_comment=reviewer_comment,
+                    reviewer_review=reviewer_review,
+                    current_cycle_reviewer_handoff=reviewer_handoff,
+                    contributor_comment=contributor_comment,
+                    contributor_handoff=contributor_comment,
+                )
+            return _decorate_response(
+                state="awaiting_contributor_response",
+                reason="completion_missing",
+                scope_fields=_current_scope_fields(review_data, current_reviewer, None, contributor_comment),
+                anchor_timestamp=reviewer_handoff.get("timestamp"),
+                reviewer_comment=reviewer_comment,
+                reviewer_review=reviewer_review,
+                current_cycle_reviewer_handoff=reviewer_handoff,
+                contributor_comment=contributor_comment,
+                contributor_handoff=contributor_comment,
+            )
         completion = review_data.get("current_cycle_completion")
         if isinstance(completion, dict) and completion.get("completed"):
             return _decorate_response(
@@ -292,6 +382,7 @@ def derive_reviewer_response_state(
                 anchor_timestamp=latest_reviewer_response.get("timestamp") if isinstance(latest_reviewer_response, dict) else None,
                 reviewer_comment=reviewer_comment,
                 reviewer_review=reviewer_review,
+                current_cycle_reviewer_handoff=reviewer_handoff,
                 contributor_comment=contributor_comment,
                 contributor_handoff=contributor_comment,
             )
@@ -303,6 +394,7 @@ def derive_reviewer_response_state(
                 anchor_timestamp=latest_reviewer_response.get("timestamp") if isinstance(latest_reviewer_response, dict) else None,
                 reviewer_comment=reviewer_comment,
                 reviewer_review=reviewer_review,
+                current_cycle_reviewer_handoff=reviewer_handoff,
                 contributor_comment=contributor_comment,
                 contributor_handoff=contributor_comment,
             )
@@ -314,6 +406,7 @@ def derive_reviewer_response_state(
                 anchor_timestamp=_initial_reviewer_anchor(review_data),
                 reviewer_comment=reviewer_comment,
                 reviewer_review=reviewer_review,
+                current_cycle_reviewer_handoff=reviewer_handoff,
                 contributor_comment=contributor_comment,
                 contributor_handoff=contributor_comment,
             )
@@ -329,6 +422,7 @@ def derive_reviewer_response_state(
                 anchor_timestamp=contributor_comment.get("timestamp") if isinstance(contributor_comment, dict) else None,
                 reviewer_comment=reviewer_comment,
                 reviewer_review=reviewer_review,
+                current_cycle_reviewer_handoff=reviewer_handoff,
                 contributor_comment=contributor_comment,
                 contributor_handoff=contributor_comment,
             )
@@ -339,6 +433,7 @@ def derive_reviewer_response_state(
             anchor_timestamp=latest_reviewer_response.get("timestamp") if isinstance(latest_reviewer_response, dict) else None,
             reviewer_comment=reviewer_comment,
             reviewer_review=reviewer_review,
+            current_cycle_reviewer_handoff=reviewer_handoff,
             contributor_comment=contributor_comment,
             contributor_handoff=contributor_comment,
         )
@@ -350,26 +445,12 @@ def derive_reviewer_response_state(
             scope_fields={"current_scope_key": None, "current_scope_basis": None},
         )
 
-    if not reviewer_comment and not reviewer_review:
-        if not had_reviewer_review:
-            return _decorate_response(
-                state="awaiting_reviewer_response",
-                reason="no_reviewer_activity",
-                scope_fields=_current_scope_fields(review_data, current_reviewer, current_head, None),
-                anchor_timestamp=_initial_reviewer_anchor(review_data),
-                reviewer_comment=reviewer_comment,
-                reviewer_review=reviewer_review,
-                contributor_comment=contributor_comment,
-                contributor_handoff=None,
-            )
-
-    latest_reviewer_response = reviewer_comment
-    if reviewer_review_helpers.compare_records(
-        reviewer_review,
-        latest_reviewer_response,
-        parse_timestamp=live_review_support.parse_github_timestamp,
-    ) > 0:
-        latest_reviewer_response = reviewer_review
+    reviewer_handoff = _current_cycle_reviewer_handoff_record(
+        review_data,
+        current_reviewer,
+        current_head,
+        issue_is_pull_request=True,
+    )
 
     contributor_handoff = contributor_comment
     contributor_revision = _contributor_revision_handoff_record(
@@ -383,6 +464,40 @@ def derive_reviewer_response_state(
         parse_timestamp=live_review_support.parse_github_timestamp,
     ) > 0:
         contributor_handoff = contributor_revision
+    if _compare_cross_channel_conversation(
+        contributor_handoff,
+        reviewer_handoff,
+        parse_timestamp=live_review_support.parse_github_timestamp,
+    ) > 0:
+        reviewer_handoff = None
+
+    if not reviewer_comment and not reviewer_review and not reviewer_handoff:
+        if not had_reviewer_review:
+            return _decorate_response(
+                state="awaiting_reviewer_response",
+                reason="no_reviewer_activity",
+                scope_fields=_current_scope_fields(review_data, current_reviewer, current_head, None),
+                anchor_timestamp=_initial_reviewer_anchor(review_data),
+                reviewer_comment=reviewer_comment,
+                reviewer_review=reviewer_review,
+                current_cycle_reviewer_handoff=reviewer_handoff,
+                contributor_comment=contributor_comment,
+                contributor_handoff=None,
+            )
+
+    latest_reviewer_response = reviewer_comment
+    if reviewer_review_helpers.compare_records(
+        reviewer_review,
+        latest_reviewer_response,
+        parse_timestamp=live_review_support.parse_github_timestamp,
+    ) > 0:
+        latest_reviewer_response = reviewer_review
+    if reviewer_review_helpers.compare_records(
+        reviewer_handoff,
+        latest_reviewer_response,
+        parse_timestamp=live_review_support.parse_github_timestamp,
+    ) > 0:
+        latest_reviewer_response = reviewer_handoff
 
     if _compare_cross_channel_conversation(
         contributor_handoff,
@@ -402,6 +517,21 @@ def derive_reviewer_response_state(
             current_head_sha=current_head,
             reviewer_comment=reviewer_comment,
             reviewer_review=reviewer_review,
+            current_cycle_reviewer_handoff=reviewer_handoff,
+            contributor_comment=contributor_comment,
+            contributor_handoff=contributor_handoff,
+        )
+
+    if reviewer_handoff is not None and latest_reviewer_response is reviewer_handoff:
+        return _decorate_response(
+            state="awaiting_contributor_response",
+            reason="accepted_same_scope_reviewer_activity",
+            scope_fields=_current_scope_fields(review_data, current_reviewer, current_head, contributor_handoff),
+            anchor_timestamp=reviewer_handoff.get("timestamp"),
+            current_head_sha=current_head,
+            reviewer_comment=reviewer_comment,
+            reviewer_review=reviewer_review,
+            current_cycle_reviewer_handoff=reviewer_handoff,
             contributor_comment=contributor_comment,
             contributor_handoff=contributor_handoff,
         )
@@ -419,6 +549,7 @@ def derive_reviewer_response_state(
                 current_head_sha=current_head,
                 reviewer_comment=reviewer_comment,
                 reviewer_review=reviewer_review,
+                current_cycle_reviewer_handoff=reviewer_handoff,
                 contributor_comment=contributor_comment,
                 contributor_handoff=contributor_handoff,
             )
@@ -438,21 +569,24 @@ def derive_reviewer_response_state(
             current_head_sha=current_head,
             reviewer_comment=reviewer_comment,
             reviewer_review=reviewer_review,
+            current_cycle_reviewer_handoff=reviewer_handoff,
             contributor_comment=contributor_comment,
             contributor_handoff=contributor_handoff,
         )
 
     latest_review_head = reviewer_review.get("reviewed_head_sha") if isinstance(reviewer_review, dict) else None
     if not isinstance(latest_review_head, str) or latest_review_head != current_head:
-        if isinstance(reviewer_comment, dict):
+        if isinstance(reviewer_comment, dict) or isinstance(reviewer_handoff, dict):
+            response_anchor = reviewer_comment if isinstance(reviewer_comment, dict) else reviewer_handoff
             return _decorate_response(
                 state="awaiting_contributor_response",
                 reason="accepted_same_scope_reviewer_activity",
                 scope_fields=_current_scope_fields(review_data, current_reviewer, current_head, contributor_handoff),
-                anchor_timestamp=reviewer_comment.get("timestamp") if isinstance(reviewer_comment.get("timestamp"), str) else None,
+                anchor_timestamp=response_anchor.get("timestamp") if isinstance(response_anchor.get("timestamp"), str) else None,
                 current_head_sha=current_head,
                 reviewer_comment=reviewer_comment,
                 reviewer_review=reviewer_review,
+                current_cycle_reviewer_handoff=reviewer_handoff,
                 contributor_comment=contributor_comment,
                 contributor_handoff=contributor_handoff,
             )
@@ -464,6 +598,7 @@ def derive_reviewer_response_state(
             current_head_sha=current_head,
             reviewer_comment=reviewer_comment,
             reviewer_review=reviewer_review,
+            current_cycle_reviewer_handoff=reviewer_handoff,
             contributor_comment=contributor_comment,
             contributor_handoff=contributor_handoff,
         )
@@ -486,6 +621,7 @@ def derive_reviewer_response_state(
             current_head_sha=current_head,
             reviewer_comment=reviewer_comment,
             reviewer_review=reviewer_review,
+            current_cycle_reviewer_handoff=reviewer_handoff,
             contributor_comment=contributor_comment,
             contributor_handoff=contributor_handoff,
         )
@@ -498,6 +634,7 @@ def derive_reviewer_response_state(
             current_head_sha=current_head,
             reviewer_comment=reviewer_comment,
             reviewer_review=reviewer_review,
+            current_cycle_reviewer_handoff=reviewer_handoff,
             contributor_comment=contributor_comment,
             contributor_handoff=contributor_handoff,
         )
@@ -509,6 +646,7 @@ def derive_reviewer_response_state(
         current_head_sha=current_head,
         reviewer_comment=reviewer_comment,
         reviewer_review=reviewer_review,
+        current_cycle_reviewer_handoff=reviewer_handoff,
         contributor_comment=contributor_comment,
         contributor_handoff=contributor_handoff,
     )

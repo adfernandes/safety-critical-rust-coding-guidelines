@@ -7,11 +7,19 @@ def test_core_review_state_types_are_limited_to_c1_mutation_scope():
     assert is_dataclass(review_state_types.AcceptedChannelRecord)
     assert is_dataclass(review_state_types.DismissalAcceptedRecord)
     assert is_dataclass(review_state_types.ReviewChannelState)
+    assert is_dataclass(review_state_types.CurrentCycleReviewerHandoff)
     assert is_dataclass(review_state_types.ReviewEntryState)
 
     assert [field.name for field in fields(review_state_types.ReviewChannelState)] == [
         "accepted",
         "seen_keys",
+    ]
+    assert [field.name for field in fields(review_state_types.CurrentCycleReviewerHandoff)] == [
+        "source_event_key",
+        "timestamp",
+        "actor",
+        "command_name",
+        "reviewed_head_sha",
     ]
     assert [field.name for field in fields(review_state_types.ReviewEntryState)] == [
         "skipped",
@@ -40,6 +48,7 @@ def test_core_review_state_types_are_limited_to_c1_mutation_scope():
         "review_dismissal",
         "current_cycle_completion",
         "current_cycle_write_approval",
+        "current_cycle_reviewer_handoff",
     ]
 
 
@@ -50,6 +59,7 @@ def test_core_review_state_types_preserve_current_sparse_and_precedence_shapes()
     assert entry.mandatory_approver_required is False
     assert entry.current_cycle_completion == {}
     assert entry.current_cycle_write_approval == {}
+    assert entry.current_cycle_reviewer_handoff is None
     assert entry.reviewer_comment.seen_keys == []
 
     accepted = review_state_types.AcceptedChannelRecord(
