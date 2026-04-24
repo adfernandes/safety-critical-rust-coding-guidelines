@@ -26,6 +26,9 @@ class ProcessingTarget(StrEnum):
     PR_TRUSTED_DIRECT = "pr_trusted_direct"
 
 
+_TRUSTED_PR_COMMENT_AUTHOR_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+
+
 class ObserverCommentClassification(StrEnum):
     EMPTY_OR_WHITESPACE = "empty_or_whitespace"
     PLAIN_TEXT = "plain_text"
@@ -53,6 +56,10 @@ def classify_issue_comment_actor(request) -> ActorClass:
     if comment_user_type == "User" and comment_author and not comment_author.endswith("[bot]") and not installation_id and not via_github_app:
         return ActorClass.REPO_USER_PRINCIPAL
     return ActorClass.UNKNOWN_ACTOR
+
+
+def comment_author_association_allows_trusted_direct(value: str) -> bool:
+    return value.strip().upper() in _TRUSTED_PR_COMMENT_AUTHOR_ASSOCIATIONS
 
 
 def comment_line_is_command(bot_mention: str, line: str) -> bool:
@@ -112,8 +119,15 @@ def classify_pr_comment_processing_target(
     if pr_admission.pr_author == "dependabot[bot]":
         return PrCommentRouterOutcome.DEFERRED_RECONCILE
     if actor_class is ActorClass.REPO_USER_PRINCIPAL and pr_admission.declared_trust_class == "pr_trusted_direct":
+        if not comment_author_association_allows_trusted_direct(request.comment_author_association):
+            return PrCommentRouterOutcome.DEFERRED_RECONCILE
         return ProcessingTarget.PR_TRUSTED_DIRECT
     raise RuntimeError("Ambiguous same-repo PR comment trust posture; failing closed")
+
+
+def is_self_comment_author(comment_author: str, *, bot_name: str, bot_mention: str) -> bool:
+    author = comment_author.strip().lower()
+    return author == bot_name.lower() or author == bot_mention.lstrip("@").lower()
 
 
 def route_issue_comment_trust(request, pr_admission: PrCommentAdmission | None, *, processing_target=None):
@@ -127,3 +141,26 @@ def route_issue_comment_trust(request, pr_admission: PrCommentAdmission | None, 
     if pr_admission is None:
         raise RuntimeError("Trusted direct PR comment handling requires pr_admission")
     return pr_admission.route_outcome
+
+
+def classify_pr_comment_router_outcome(
+    request,
+    pr_admission: PrCommentAdmission,
+    *,
+    is_self_comment: bool,
+) -> PrCommentRouterOutcome:
+    actor_class = classify_issue_comment_actor(request)
+    processing_target = classify_pr_comment_processing_target(
+        request,
+        pr_admission,
+        actor_class=actor_class,
+        is_self_comment=is_self_comment,
+    )
+    outcome = route_issue_comment_trust(
+        request,
+        pr_admission,
+        processing_target=processing_target,
+    )
+    if isinstance(outcome, PrCommentRouterOutcome):
+        return outcome
+    raise RuntimeError("PR comment router outcome must be trusted_direct, deferred_reconcile, or safe_noop")

@@ -249,6 +249,9 @@ def build_comment_event_request(bot: EventInputsContext, *, issue_number: int | 
     comment_user_type = bot.get_config_value("COMMENT_USER_TYPE").strip()
     if not comment_user_type:
         problems.append("COMMENT_USER_TYPE must be non-empty")
+    comment_author_association = bot.get_config_value("COMMENT_AUTHOR_ASSOCIATION").strip().upper()
+    if is_pull_request is True and not comment_author_association:
+        problems.append("COMMENT_AUTHOR_ASSOCIATION must be non-empty for PR comments")
     comment_sender_type = bot.get_config_value("COMMENT_SENDER_TYPE").strip()
     if not comment_sender_type:
         problems.append("COMMENT_SENDER_TYPE must be non-empty")
@@ -274,6 +277,7 @@ def build_comment_event_request(bot: EventInputsContext, *, issue_number: int | 
         comment_sender_type=comment_sender_type,
         comment_installation_id=comment_installation_id,
         comment_performed_via_github_app=comment_performed_via_github_app,
+        comment_author_association=comment_author_association,
     )
 
 
@@ -448,6 +452,21 @@ def build_replay_comment_event_request(payload, *, live_comment=None, comment_bo
     if not hasattr(payload, "issue_state") or not hasattr(payload, "issue_author") or not hasattr(payload, "issue_labels"):
         raise InvalidEventInput("build_replay_comment_event_request", ("typed deferred comment payload required",))
     resolved_body = payload.comment_body if comment_body is None else comment_body
+    comment_sender_type = (
+        live_comment.comment_sender_type
+        if live_comment is not None and live_comment.comment_sender_type_available
+        else payload.comment_sender_type
+    )
+    comment_installation_id = (
+        live_comment.comment_installation_id
+        if live_comment is not None and live_comment.comment_installation_id_available
+        else payload.comment_installation_id
+    )
+    comment_performed_via_github_app = (
+        live_comment.comment_performed_via_github_app
+        if live_comment is not None and live_comment.comment_performed_via_github_app_available
+        else payload.comment_performed_via_github_app
+    )
     return CommentEventRequest(
         issue_number=payload.identity.pr_number,
         is_pull_request=True,
@@ -461,11 +480,7 @@ def build_replay_comment_event_request(payload, *, live_comment=None, comment_bo
         comment_created_at=payload.comment_created_at,
         comment_source_event_key=payload.identity.source_event_key,
         comment_user_type=(live_comment.comment_user_type if live_comment is not None else payload.comment_user_type),
-        comment_sender_type=(live_comment.comment_sender_type if live_comment is not None else payload.comment_sender_type),
-        comment_installation_id=(live_comment.comment_installation_id if live_comment is not None else payload.comment_installation_id),
-        comment_performed_via_github_app=(
-            live_comment.comment_performed_via_github_app
-            if live_comment is not None
-            else payload.comment_performed_via_github_app
-        ),
+        comment_sender_type=comment_sender_type,
+        comment_installation_id=comment_installation_id,
+        comment_performed_via_github_app=comment_performed_via_github_app,
     )

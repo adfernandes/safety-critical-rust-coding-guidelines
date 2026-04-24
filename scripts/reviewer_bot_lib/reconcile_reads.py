@@ -21,9 +21,12 @@ class LivePrReplayContext:
 class LiveCommentReplayContext:
     comment_author: str
     comment_user_type: str
-    comment_sender_type: str
-    comment_installation_id: str
-    comment_performed_via_github_app: bool
+    comment_sender_type: str | None
+    comment_installation_id: str | None
+    comment_performed_via_github_app: bool | None
+    comment_sender_type_available: bool = False
+    comment_installation_id_available: bool = False
+    comment_performed_via_github_app_available: bool = False
 
 
 def read_reconcile_object(bot, endpoint: str, *, label: str) -> dict:
@@ -96,10 +99,51 @@ def read_live_comment_replay_context(live_comment: dict, payload: dict) -> LiveC
     comment_user_type = user.get("type")
     if not isinstance(comment_user_type, str) or not comment_user_type.strip():
         raise RuntimeError("Live deferred comment user type is unavailable")
+    sender = live_comment.get("sender")
+    comment_sender_type = None
+    comment_sender_type_available = False
+    if isinstance(sender, dict):
+        sender_type = sender.get("type")
+        if isinstance(sender_type, str) and sender_type.strip():
+            comment_sender_type = sender_type.strip()
+            comment_sender_type_available = True
+    installation = live_comment.get("installation")
+    comment_installation_id = None
+    comment_installation_id_available = False
+    if isinstance(installation, dict):
+        installation_id = installation.get("id")
+        if installation_id is not None and str(installation_id).strip():
+            try:
+                if int(installation_id) > 0:
+                    comment_installation_id = str(installation_id).strip()
+                    comment_installation_id_available = True
+            except (TypeError, ValueError):
+                pass
+    performed_via_app_available = False
+    performed_via_app = live_comment.get("performed_via_github_app")
+    comment_performed_via_github_app = None
+    if "performed_via_github_app" in live_comment:
+        if isinstance(performed_via_app, bool):
+            comment_performed_via_github_app = performed_via_app
+            performed_via_app_available = True
+        elif isinstance(performed_via_app, dict):
+            app_id = performed_via_app.get("id")
+            if app_id is not None and str(app_id).strip():
+                try:
+                    comment_performed_via_github_app = int(app_id) > 0
+                    performed_via_app_available = True
+                except (TypeError, ValueError):
+                    pass
+        elif performed_via_app is None:
+            comment_performed_via_github_app = False
+            performed_via_app_available = True
     return LiveCommentReplayContext(
         comment_author=comment_author,
         comment_user_type=comment_user_type,
-        comment_sender_type=comment_user_type,
-        comment_installation_id="",
-        comment_performed_via_github_app=bool(live_comment.get("performed_via_github_app")),
+        comment_sender_type=comment_sender_type,
+        comment_installation_id=comment_installation_id,
+        comment_performed_via_github_app=comment_performed_via_github_app,
+        comment_sender_type_available=comment_sender_type_available,
+        comment_installation_id_available=comment_installation_id_available,
+        comment_performed_via_github_app_available=performed_via_app_available,
     )

@@ -72,8 +72,8 @@ def _classify_event_intent_from_context(bot: AppEventContextRuntime, context: Ev
     if event_name == "issue_comment":
         if event_action == "created":
             if context.is_pull_request is True:
-                trust_class = bot.get_config_value("REVIEWER_BOT_TRUST_CLASS").strip()
-                if trust_class in {"pr_deferred_reconcile", "safe_noop"}:
+                route_outcome = bot.get_config_value("REVIEWER_BOT_ROUTE_OUTCOME").strip()
+                if route_outcome in {"deferred_reconcile", "safe_noop"}:
                     return bot.EVENT_INTENT_NON_MUTATING_DEFER
             return bot.EVENT_INTENT_MUTATING
         return bot.EVENT_INTENT_NON_MUTATING_READONLY
@@ -138,16 +138,8 @@ def execute_run(bot: AppExecutionRuntime, context: EventContext) -> ExecutionRes
     event_name = context.event_name
     event_action = context.event_action
     event_intent = _classify_event_intent_from_context(bot, context)
-    lock_required = event_intent == bot.EVENT_INTENT_MUTATING
-    _log(
-        bot,
-        "info",
-        f"Event: {event_name}, Action: {event_action}, Intent: {event_intent}, Lock Required: {lock_required}",
-        event_name=event_name,
-        event_action=event_action,
-        event_intent=event_intent,
-        lock_required=lock_required,
-    )
+    workflow_run_missing_optional_payload = False
+    lock_required = False
 
     lock_acquired = False
     release_failed = False
@@ -166,6 +158,26 @@ def execute_run(bot: AppExecutionRuntime, context: EventContext) -> ExecutionRes
     schedule_result: maintenance.ScheduleHandlerResult | None = None
 
     try:
+        if (
+            event_name == "workflow_run"
+            and event_action == "completed"
+            and context.workflow_kind == "reconcile"
+            and context.workflow_run_triggering_conclusion == "success"
+            and reconcile.optional_router_payload_missing(bot, context)
+        ):
+            workflow_run_missing_optional_payload = True
+            event_intent = bot.EVENT_INTENT_NON_MUTATING_READONLY
+        lock_required = event_intent == bot.EVENT_INTENT_MUTATING
+        _log(
+            bot,
+            "info",
+            f"Event: {event_name}, Action: {event_action}, Intent: {event_intent}, Lock Required: {lock_required}",
+            event_name=event_name,
+            event_action=event_action,
+            event_intent=event_intent,
+            lock_required=lock_required,
+        )
+
         if lock_required:
             bot.locks.acquire()
             lock_acquired = True
@@ -219,7 +231,14 @@ def execute_run(bot: AppExecutionRuntime, context: EventContext) -> ExecutionRes
 
         elif event_name == "issue_comment":
             if event_action == "created":
-                state_changed = bot.handlers.handle_comment_event(state)
+                if event_intent == bot.EVENT_INTENT_NON_MUTATING_DEFER:
+                    _log(
+                        bot,
+                        "info",
+                        "Skipping direct PR issue-comment mutation for deferred router outcome.",
+                    )
+                else:
+                    state_changed = bot.handlers.handle_comment_event(state)
 
         elif event_name == "workflow_dispatch":
             state_changed = bot.handlers.handle_manual_dispatch(state)
@@ -230,7 +249,13 @@ def execute_run(bot: AppExecutionRuntime, context: EventContext) -> ExecutionRes
 
         elif event_name == "workflow_run":
             if event_action == "completed":
-                if context.workflow_kind == "reconcile" and context.workflow_run_triggering_conclusion == "success":
+                if workflow_run_missing_optional_payload:
+                    _log(
+                        bot,
+                        "info",
+                        "Skipping successful router workflow_run with no deferred artifact.",
+                    )
+                elif context.workflow_kind == "reconcile" and context.workflow_run_triggering_conclusion == "success":
                     workflow_run_result = reconcile.handle_workflow_run_event_result(bot, state)
                     state_changed = workflow_run_result.state_changed
                 else:

@@ -10,6 +10,7 @@ from scripts.reviewer_bot_lib import (
     maintenance,
     maintenance_schedule,
     reconcile,
+    review_state,
     state_store,
 )
 from scripts.reviewer_bot_lib.config import STATUS_AWAITING_REVIEWER_RESPONSE_LABEL
@@ -148,6 +149,117 @@ def test_execute_run_reloads_state_before_syncing_status_labels(monkeypatch):
         "issue_numbers": [42],
     }
     assert release_calls == ["released"]
+
+
+def test_execute_run_deferred_pr_issue_comment_does_not_call_direct_handler(monkeypatch):
+    harness = AppHarness(monkeypatch)
+    harness.set_event(
+        EVENT_NAME="issue_comment",
+        EVENT_ACTION="created",
+        IS_PULL_REQUEST="true",
+        REVIEWER_BOT_ROUTE_OUTCOME="deferred_reconcile",
+    )
+    handler_calls = []
+    lock_calls = []
+    harness.stub_lock(
+        acquire=lambda: lock_calls.append("acquired"),
+        release=lambda: lock_calls.append("released") or True,
+    )
+    harness.stub_load_state(lambda *, fail_on_unavailable=False: make_state())
+    harness.stub_handler("handle_comment_event", lambda state: handler_calls.append(state) or True)
+
+    result = harness.run_execute()
+
+    assert result.exit_code == 0
+    assert result.state_changed is False
+    assert lock_calls == []
+    assert handler_calls == []
+
+
+def test_execute_run_successful_router_without_artifact_stays_read_only(monkeypatch):
+    harness = AppHarness(monkeypatch)
+    harness.set_workflow_run_name("Reviewer Bot PR Comment Router")
+    harness.set_event(
+        EVENT_NAME="workflow_run",
+        EVENT_ACTION="completed",
+        REVIEWER_BOT_WORKFLOW_KIND="reconcile",
+        WORKFLOW_RUN_TRIGGERING_CONCLUSION="success",
+    )
+    calls = []
+    harness.runtime.load_deferred_payload = lambda: (_ for _ in ()).throw(RuntimeError("missing artifact"))
+    harness.stub_lock(acquire=lambda: calls.append("lock_acquire"), release=lambda: calls.append("lock_release") or True)
+    harness.stub_pass_until(lambda state: calls.append("pass_until") or (state, []))
+    harness.stub_sync_members(lambda state: calls.append("sync_members") or (state, []))
+    monkeypatch.setattr(
+        reconcile,
+        "handle_workflow_run_event_result",
+        lambda bot, state: pytest.fail("missing router artifact must skip reconcile before mutating phases"),
+    )
+
+    result = harness.run_execute()
+
+    assert result.exit_code == 0
+    assert result.state_changed is False
+    assert calls == []
+    assert harness.state_store.save_calls == []
+
+
+def test_execute_run_non_success_workflow_run_reconcile_stays_read_only_and_non_closing(monkeypatch):
+    harness = AppHarness(monkeypatch)
+    harness.set_workflow_run_name("Reviewer Bot PR Review Submitted Observer")
+    harness.set_event(
+        EVENT_NAME="workflow_run",
+        EVENT_ACTION="completed",
+        REVIEWER_BOT_WORKFLOW_KIND="reconcile",
+        WORKFLOW_RUN_TRIGGERING_CONCLUSION="failure",
+    )
+    state = make_state(epoch="freshness_v15")
+    review = review_state.ensure_review_entry(state, 42, create=True)
+    assert review is not None
+    review["sidecars"]["deferred_gaps"]["pull_request_review:11"] = {"reason": "artifact_missing"}
+    calls = []
+    harness.stub_lock(acquire=lambda: calls.append("lock_acquire"), release=lambda: calls.append("lock_release") or True)
+    harness.stub_load_state(lambda *, fail_on_unavailable=False: state)
+    harness.stub_pass_until(lambda current: calls.append("pass_until") or (current, []))
+    harness.stub_sync_members(lambda current: calls.append("sync_members") or (current, []))
+    monkeypatch.setattr(
+        reconcile,
+        "handle_workflow_run_event_result",
+        lambda bot, current: pytest.fail("non-success workflow_run must not enter reconcile"),
+    )
+
+    result = harness.run_execute()
+
+    assert result.exit_code == 0
+    assert result.state_changed is False
+    assert calls == []
+    assert harness.state_store.save_calls == []
+    assert review["sidecars"]["deferred_gaps"] == {"pull_request_review:11": {"reason": "artifact_missing"}}
+    assert review["sidecars"]["reconciled_source_events"] == {}
+
+
+def test_execute_run_malformed_optional_router_artifact_fails_in_app_path(monkeypatch):
+    harness = AppHarness(monkeypatch)
+    harness.set_workflow_run_name("Reviewer Bot PR Comment Router")
+    harness.set_event(
+        EVENT_NAME="workflow_run",
+        EVENT_ACTION="completed",
+        REVIEWER_BOT_WORKFLOW_KIND="reconcile",
+        WORKFLOW_RUN_TRIGGERING_CONCLUSION="success",
+    )
+    calls = []
+    harness.runtime.load_deferred_payload = lambda: (_ for _ in ()).throw(RuntimeError("invalid deferred context"))
+    harness.stub_lock(acquire=lambda: calls.append("lock_acquire"), release=lambda: calls.append("lock_release") or True)
+    harness.stub_pass_until(lambda state: calls.append("pass_until") or (state, []))
+    harness.stub_sync_members(lambda state: calls.append("sync_members") or (state, []))
+
+    result = harness.run_execute()
+
+    assert result.exit_code == 1
+    assert result.state_changed is False
+    assert calls == []
+    assert harness.state_store.load_calls == []
+    assert harness.state_store.save_calls == []
 
 
 def test_execute_run_opened_issue_assignment_failure_does_not_persist_reviewer_state(monkeypatch):
