@@ -182,7 +182,6 @@ def handle_comment_event(
     issue_number = comment_request.issue_number
     if not issue_number:
         return False
-    bot.collect_touched_item(issue_number)
     route = _route_issue_comment_trust(
         bot,
         comment_request,
@@ -192,7 +191,6 @@ def handle_comment_event(
         return False
     if route == comment_routing_policy.ProcessingTarget.ISSUE_DIRECT:
         if comment_request.issue_state == "closed":
-            removed = state.get("active_reviews", {}).pop(str(issue_number), None)
             _log(
                 bot,
                 "info",
@@ -200,12 +198,14 @@ def handle_comment_event(
                 issue_number=issue_number,
                 issue_state=comment_request.issue_state,
             )
-            return removed is not None
+            return False
+        bot.collect_touched_item(issue_number)
         return _process_comment_event(bot, state, comment_request)
     if route == PrCommentRouterOutcome.TRUSTED_DIRECT:
         if comment_request.issue_state != "open":
             return False
         if not _require_v18_for_pr(bot, state, comment_request, "pr_trusted_direct_comment"):
             return False
+        bot.collect_touched_item(issue_number)
         return _process_comment_event(bot, state, comment_request)
     raise RuntimeError("Deferred PR comment events must not mutate directly in trusted workflows")

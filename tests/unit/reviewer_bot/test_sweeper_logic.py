@@ -29,6 +29,14 @@ def _runtime(monkeypatch):
     return FakeReviewerBotRuntime(monkeypatch)
 
 
+def _review_dismissed_timeline_event(review_id: int, *, created_at: str) -> dict:
+    return {
+        "event": "review_dismissed",
+        "created_at": created_at,
+        "dismissed_review": {"review_id": review_id, "state": "commented"},
+    }
+
+
 def test_sweeper_creates_keyed_deferred_gaps_for_visible_comments_reviews_and_dismissals(monkeypatch, freeze_sweeper_now):
     freeze_sweeper_now("2026-03-25T12:30:00Z")
     runtime = _runtime(monkeypatch)
@@ -65,11 +73,16 @@ def test_sweeper_creates_keyed_deferred_gaps_for_visible_comments_reviews_and_di
             payload={"workflow_runs": []},
         )
         .add_request("GET", "pulls/42/comments?per_page=100&page=1", status_code=200, payload=[])
+        .add_request(
+            "GET",
+            "issues/42/timeline?per_page=100&page=1",
+            status_code=200,
+            payload=[_review_dismissed_timeline_event(303, created_at="2026-03-25T12:00:00Z")],
+        )
     )
     runtime.github.stub(routes)
     runtime.github.get_pull_request_reviews = lambda issue_number: [
         pull_request_review_event(202, submitted_at="2026-03-25T11:00:00Z", state="APPROVED"),
-        pull_request_review_event(303, submitted_at="2026-03-25T09:00:00Z", updated_at="2026-03-25T12:00:00Z", state="DISMISSED"),
     ]
 
     assert sweeper.sweep_deferred_gaps(runtime, state) is True
@@ -110,6 +123,7 @@ def test_sweeper_creates_keyed_deferred_gap_for_visible_review_comments(monkeypa
             status_code=200,
             payload={"workflow_runs": []},
         )
+        .add_request("GET", "issues/42/timeline?per_page=100&page=1", status_code=200, payload=[])
     )
     runtime.github.stub(routes)
     runtime.github.get_pull_request_reviews = lambda issue_number: []
@@ -190,7 +204,7 @@ def test_sweeper_skips_dismissed_reviews_already_reconciled_by_source_event_key(
     review["sidecars"]["reconciled_source_events"] = {
         "pull_request_review_dismissed:303": {
             "source_event_key": "pull_request_review_dismissed:303",
-            "reconciled_at": None,
+            "reconciled_at": "2026-03-17T12:01:00+00:00",
         }
     }
     routes = (
@@ -200,12 +214,47 @@ def test_sweeper_skips_dismissed_reviews_already_reconciled_by_source_event_key(
         .add_request("GET", "issues/42/comments?per_page=100&page=1", status_code=200, payload=[])
         .add_request("GET", "issues/42/comments?per_page=100&page=2", status_code=200, payload=[])
         .add_request("GET", "pulls/42/comments?per_page=100&page=1", status_code=200, payload=[])
+        .add_request(
+            "GET",
+            "issues/42/timeline?per_page=100&page=1",
+            status_code=200,
+            payload=[_review_dismissed_timeline_event(303, created_at="2026-03-17T12:00:00Z")],
+        )
     )
     runtime.github.stub(routes)
-    runtime.github.get_pull_request_reviews = lambda issue_number: [pull_request_review_event(303, submitted_at="2026-03-17T09:00:00Z", updated_at="2026-03-17T12:00:00Z", state="DISMISSED")]
+    runtime.github.get_pull_request_reviews = lambda issue_number: []
 
     assert sweeper.sweep_deferred_gaps(runtime, state) is False
     assert state["active_reviews"]["42"]["sidecars"]["deferred_gaps"] == {}
+
+
+def test_discover_visible_review_dismissal_events_uses_exact_timeline_event(monkeypatch, freeze_sweeper_now):
+    freeze_sweeper_now("2026-03-25T12:30:00Z")
+    runtime = _runtime(monkeypatch)
+    review = review_state.ensure_review_entry(make_state(), 42, create=True)
+    assert review is not None
+    runtime.github.stub(
+        RouteGitHubApi().add_request(
+            "GET",
+            "issues/42/timeline?per_page=100&page=1",
+            status_code=200,
+            payload=[_review_dismissed_timeline_event(303, created_at="2026-03-25T12:00:00Z")],
+        )
+    )
+
+    discovered, complete = sweeper._discover_visible_review_dismissal_events(runtime, 42, review)
+
+    assert complete is True
+    assert discovered == [
+        {
+            "source_event_key": "pull_request_review_dismissed:303",
+            "source_event_name": "pull_request_review",
+            "source_event_action": "dismissed",
+            "source_created_at": "2026-03-25T12:00:00Z",
+            "object_id": "303",
+            "surface": "reviews_dismissed",
+        }
+    ]
 
 
 def test_sweeper_skips_events_already_reconciled_by_source_event_key(monkeypatch, freeze_sweeper_now):
@@ -216,8 +265,8 @@ def test_sweeper_skips_events_already_reconciled_by_source_event_key(monkeypatch
     assert review is not None
     review["current_reviewer"] = "alice"
     review["sidecars"]["reconciled_source_events"] = {
-        "issue_comment:101": {"source_event_key": "issue_comment:101", "reconciled_at": None},
-        "pull_request_review:202": {"source_event_key": "pull_request_review:202", "reconciled_at": None},
+        "issue_comment:101": {"source_event_key": "issue_comment:101", "reconciled_at": "2026-03-17T10:01:00+00:00"},
+        "pull_request_review:202": {"source_event_key": "pull_request_review:202", "reconciled_at": "2026-03-17T11:01:00+00:00"},
     }
     routes = (
         RouteGitHubApi()
@@ -237,6 +286,7 @@ def test_sweeper_skips_events_already_reconciled_by_source_event_key(monkeypatch
             payload={"workflow_runs": []},
         )
         .add_request("GET", "pulls/42/comments?per_page=100&page=1", status_code=200, payload=[])
+        .add_request("GET", "issues/42/timeline?per_page=100&page=1", status_code=200, payload=[])
     )
     runtime.github.stub(routes)
     runtime.github.get_pull_request_reviews = lambda issue_number: [pull_request_review_event(202, submitted_at="2026-03-17T11:00:00Z", state="APPROVED")]
@@ -269,7 +319,65 @@ def test_discover_visible_comment_events_skips_github_actions_and_bot_comments(m
     assert [item["source_event_key"] for item in discovered] == ["issue_comment:101"]
 
 
-def test_sweeper_visible_review_repair_refreshes_current_reviewer_activity_without_artifact(monkeypatch, freeze_sweeper_now):
+def test_bot_authored_comment_false_positive_cleanup_is_narrow_hygiene(monkeypatch):
+    runtime = _runtime(monkeypatch)
+    review = review_state.ensure_review_entry(make_state(), 42, create=True)
+    assert review is not None
+    review["sidecars"]["deferred_gaps"] = {
+        "issue_comment:210": {"reason": "artifact_missing"},
+        "pull_request_review:202": {"reason": "artifact_missing"},
+    }
+    runtime.github.stub(
+        RouteGitHubApi().add_request(
+            "GET",
+            "issues/comments/210",
+            status_code=200,
+            payload=issue_comment_event(
+                210,
+                created_at="2026-03-25T10:00:00Z",
+                login="github-actions[bot]",
+                user_type="Bot",
+            ),
+        )
+    )
+
+    assert sweeper._clear_bot_authored_comment_false_positive(runtime, review, "issue_comment:210") is True
+
+    assert review["sidecars"]["deferred_gaps"] == {"pull_request_review:202": {"reason": "artifact_missing"}}
+    assert review["sidecars"]["reconciled_source_events"] == {}
+
+
+def test_bot_authored_comment_false_positive_cleanup_rejects_human_comment(monkeypatch):
+    runtime = _runtime(monkeypatch)
+    review = review_state.ensure_review_entry(make_state(), 42, create=True)
+    assert review is not None
+    review["sidecars"]["deferred_gaps"] = {"issue_comment:210": {"reason": "artifact_missing"}}
+    runtime.github.stub(
+        RouteGitHubApi().add_request(
+            "GET",
+            "issues/comments/210",
+            status_code=200,
+            payload=issue_comment_event(210, created_at="2026-03-25T10:00:00Z", login="alice"),
+        )
+    )
+
+    assert sweeper._clear_bot_authored_comment_false_positive(runtime, review, "issue_comment:210") is False
+
+    assert review["sidecars"]["deferred_gaps"] == {"issue_comment:210": {"reason": "artifact_missing"}}
+
+
+def test_bot_authored_comment_false_positive_cleanup_rejects_non_comment_key(monkeypatch):
+    runtime = _runtime(monkeypatch)
+    review = review_state.ensure_review_entry(make_state(), 42, create=True)
+    assert review is not None
+    review["sidecars"]["deferred_gaps"] = {"pull_request_review:202": {"reason": "artifact_missing"}}
+
+    assert sweeper._clear_bot_authored_comment_false_positive(runtime, review, "pull_request_review:202") is False
+
+    assert review["sidecars"]["deferred_gaps"] == {"pull_request_review:202": {"reason": "artifact_missing"}}
+
+
+def test_sweeper_visible_review_discovery_records_diagnostic_without_replay_mutation(monkeypatch, freeze_sweeper_now):
     freeze_sweeper_now("2026-03-25T12:30:00Z")
     runtime = _runtime(monkeypatch)
     state = make_state()
@@ -293,19 +401,22 @@ def test_sweeper_visible_review_repair_refreshes_current_reviewer_activity_witho
         .add_request("GET", "issues/42/comments?per_page=100&page=1", status_code=200, payload=[])
         .add_request("GET", "pulls/42/reviews?per_page=100&page=1", status_code=200, payload=[])
         .add_request("GET", "pulls/42/comments?per_page=100&page=1", status_code=200, payload=[])
+        .add_request("GET", "issues/42/timeline?per_page=100&page=1", status_code=200, payload=[])
     )
     runtime.github.stub(routes)
     runtime.github.get_pull_request_reviews = lambda issue_number: [pull_request_review_event(202, submitted_at="2026-03-25T11:00:00Z", state="COMMENTED", commit_id="head-1")]
 
     assert sweeper.sweep_deferred_gaps(runtime, state) is True
-    assert review["last_reviewer_activity"] == "2026-03-25T11:00:00Z"
-    assert review["transition_warning_sent"] is None
-    assert review["transition_notice_sent_at"] is None
-    assert "pull_request_review:202" not in review["sidecars"]["deferred_gaps"]
-    assert "pull_request_review:202" in review["sidecars"]["reconciled_source_events"]
+    assert review.get("last_reviewer_activity") is None
+    assert review["transition_warning_sent"] == "2026-03-18T00:00:00Z"
+    assert review["transition_notice_sent_at"] == "2026-03-25T00:00:00Z"
+    gap = review["sidecars"]["deferred_gaps"]["pull_request_review:202"]
+    assert gap["reason"] == "observer_state_unknown"
+    assert gap["visible_review_diagnostic"]["category"] == "visible_review_without_replay_artifact"
+    assert "pull_request_review:202" not in review["sidecars"]["reconciled_source_events"]
 
 
-def test_visible_review_repair_does_not_clear_transition_warning_for_stale_replayed_review(monkeypatch, freeze_sweeper_now):
+def test_visible_review_diagnostic_does_not_clear_transition_warning_for_stale_replayed_review(monkeypatch, freeze_sweeper_now):
     freeze_sweeper_now("2026-03-25T12:30:00Z")
     runtime = _runtime(monkeypatch)
     state = make_state()
@@ -330,6 +441,7 @@ def test_visible_review_repair_does_not_clear_transition_warning_for_stale_repla
         .add_request("GET", "issues/42/comments?per_page=100&page=1", status_code=200, payload=[])
         .add_request("GET", "pulls/42/reviews?per_page=100&page=1", status_code=200, payload=[])
         .add_request("GET", "pulls/42/comments?per_page=100&page=1", status_code=200, payload=[])
+        .add_request("GET", "issues/42/timeline?per_page=100&page=1", status_code=200, payload=[])
     )
     runtime.github.stub(routes)
     runtime.github.get_pull_request_reviews = lambda issue_number: [pull_request_review_event(202, submitted_at="2026-03-25T11:00:00Z", state="COMMENTED", commit_id="head-1")]
@@ -338,48 +450,18 @@ def test_visible_review_repair_does_not_clear_transition_warning_for_stale_repla
     assert review["last_reviewer_activity"] == "2026-03-25T11:00:00Z"
     assert review["transition_warning_sent"] == "2026-04-01T12:12:04Z"
     assert review["transition_notice_sent_at"] == "2026-04-15T12:12:04Z"
+    assert "pull_request_review:202" in review["sidecars"]["deferred_gaps"]
+    assert "pull_request_review:202" not in review["sidecars"]["reconciled_source_events"]
 
 
-def test_repair_visible_review_gap_returns_true_for_bookkeeping_only_mutations(monkeypatch):
-    runtime = _runtime(monkeypatch)
-    review = review_state.ensure_review_entry(make_state(), 42, create=True)
-    assert review is not None
-    review["current_reviewer"] = "alice"
-    review["active_cycle_started_at"] = "2026-03-17T09:00:00Z"
-    review["sidecars"]["deferred_gaps"]["pull_request_review:303"] = {"reason": "artifact_missing"}
-    monkeypatch.setattr(sweeper, "accept_reviewer_review_from_live_review", lambda review_data, live_review, actor=None: False)
-    monkeypatch.setattr(sweeper, "refresh_reviewer_review_from_live_preferred_review", lambda bot, issue_number, review_data, actor=None: (False, None))
-    monkeypatch.setattr(sweeper, "rebuild_pr_approval_state", lambda bot, issue_number, review_data: (None, None))
+def test_sweeper_no_longer_owns_visible_review_replay_mutation():
+    module_text = Path("scripts/reviewer_bot_lib/sweeper.py").read_text(encoding="utf-8")
 
-    changed = sweeper._repair_visible_review_gap(
-        runtime,
-        review,
-        42,
-        "pull_request_review:303",
-        pull_request_review_event(303, submitted_at="2026-03-25T11:00:00Z", state="COMMENTED", commit_id="head-1"),
-    )
-
-    assert changed is True
-    assert "pull_request_review:303" in review["sidecars"]["reconciled_source_events"]
-    assert "pull_request_review:303" not in review["sidecars"]["deferred_gaps"]
-
-
-def test_load_surface_watermark_lazily_materializes_missing_surface_state(monkeypatch):
-    review = review_state.ensure_review_entry(make_state(), 42, create=True)
-    assert review is not None
-
-    watermark = sweeper._load_surface_watermark(review, "reviewer_comment")
-
-    assert watermark == {
-        "last_scan_started_at": None,
-        "last_scan_completed_at": None,
-        "last_safe_event_time": None,
-        "last_safe_event_id": None,
-        "lookback_seconds": None,
-        "bootstrap_window_seconds": None,
-        "bootstrap_completed_at": None,
-    }
-    assert review["sidecars"]["observer_discovery_watermarks"]["reviewer_comment"] == watermark
+    assert "def _repair_visible_review_gap(" not in module_text
+    assert "accept_reviewer_review_from_live_review" not in module_text
+    assert "refresh_reviewer_review_from_live_preferred_review" not in module_text
+    assert "record_reviewer_activity" not in module_text
+    assert "rebuild_pr_approval_state" not in module_text
 
 
 def test_observer_run_reason_mapping_and_near_miss_signature():
@@ -417,7 +499,7 @@ def test_sweeper_delegates_diagnosis_and_narrow_recommendation_to_core_owner():
     assert "def evaluate_deferred_gap_state(" not in module_text
     assert "def _can_repair_visible_review(" not in module_text
     assert "deferred_gap_diagnosis.evaluate_deferred_gap_state(" in module_text
-    assert "deferred_gap_diagnosis.recommend_review_submission_gap_repair(" in module_text
+    assert "deferred_gap_diagnosis.describe_review_submission_gap_diagnostic(" in module_text
 
 
 def test_h4a_review_submission_gap_fixture_stays_narrow_and_explicit():
@@ -425,7 +507,7 @@ def test_h4a_review_submission_gap_fixture_stays_narrow_and_explicit():
         Path("tests/fixtures/equivalence/review_submission_gap_repair/scenario_matrix.json").read_text(encoding="utf-8")
     )
 
-    assert matrix["harness_id"] == "H4a review-submitted gap repair flow equivalence"
+    assert matrix["harness_id"] == "H4a review-submitted gap diagnostic flow equivalence"
     assert matrix["out_of_scope"] == [
         "production cutover",
         "other sweeper repair flows",
@@ -433,6 +515,7 @@ def test_h4a_review_submission_gap_fixture_stays_narrow_and_explicit():
     assert [scenario["scenario_id"] for scenario in matrix["scenarios"]] == [
         "submitted_review_visible_without_exact_artifact",
     ]
+    assert matrix["scenarios"][0]["expected_diagnostic_category"] == "visible_review_without_replay_artifact"
 
 
 def test_stage_a_candidate_run_correlation_is_exact_to_workflow_event_pr_and_window(monkeypatch):
@@ -552,3 +635,28 @@ def test_sweeper_fetches_single_candidate_run_detail_without_exact_artifact_matc
     detail = sweeper._maybe_fetch_single_candidate_run_detail(runtime, run_correlation, {"status": "no_exact_artifact_match"})
     assert detail == {"id": 123, "status": "completed", "conclusion": "action_required"}
     assert run_correlation["correlated_run"] == 123
+
+
+def test_sweeper_routes_deferred_sidecar_shapes_through_bookkeeping_owner():
+    module_text = Path("scripts/reviewer_bot_lib/sweeper.py").read_text(encoding="utf-8")
+    observer_correlation_text = Path("scripts/reviewer_bot_lib/sweeper_observer_correlation.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "gap_bookkeeping.list_deferred_gap_keys(" in module_text
+    assert "gap_bookkeeping.get_deferred_gap(" in module_text
+    assert "gap_bookkeeping.update_deferred_gap_fields(" in module_text
+    assert "gap_bookkeeping.begin_observer_surface_scan(" in module_text
+    assert "gap_bookkeeping.clear_automation_comment_false_positive(" in module_text
+    assert "gap_bookkeeping.ensure_observer_discovery_watermark(" not in module_text
+    assert "gap_bookkeeping.clear_automation_comment_gap(" not in module_text
+    assert "gap_bookkeeping.record_observer_watermark_event(" in observer_correlation_text
+    assert "gap_bookkeeping.record_observer_watermark_empty_scan(" in observer_correlation_text
+    assert "gap_bookkeeping._observer_discovery_watermarks(" not in module_text
+    assert "gap_bookkeeping._observer_discovery_watermarks(" not in observer_correlation_text
+    assert "last_scan_started_at" not in module_text
+    assert "last_safe_event_time" not in observer_correlation_text
+    assert "last_scan_completed_at" not in observer_correlation_text
+    assert "review_data.get(\"deferred_gaps\"" not in module_text
+    assert "[\"deferred_gaps\"]" not in module_text
+    assert "[\"reconciled_source_events\"]" not in module_text

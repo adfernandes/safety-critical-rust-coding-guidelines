@@ -150,6 +150,7 @@ def execute_run(bot: AppExecutionRuntime, context: EventContext) -> ExecutionRes
     sync_changes: list[str] = []
     restored: list[str] = []
     loaded_active_reviews_count = 0
+    loaded_active_review_numbers: set[int] = set()
     touched_items: list[int] = []
     projection_failure: RuntimeError | None = None
     loaded_epoch: str | None = None
@@ -186,6 +187,11 @@ def execute_run(bot: AppExecutionRuntime, context: EventContext) -> ExecutionRes
         active_reviews = state.get("active_reviews")
         if isinstance(active_reviews, dict):
             loaded_active_reviews_count = len(active_reviews)
+            loaded_active_review_numbers = {
+                int(issue_key)
+                for issue_key in active_reviews
+                if isinstance(issue_key, str) and issue_key.isdigit()
+            }
         loaded_epoch = state.get("freshness_runtime_epoch") if isinstance(state.get("freshness_runtime_epoch"), str) else None
 
         if lock_required:
@@ -241,7 +247,11 @@ def execute_run(bot: AppExecutionRuntime, context: EventContext) -> ExecutionRes
                     state_changed = bot.handlers.handle_comment_event(state)
 
         elif event_name == "workflow_dispatch":
-            state_changed = bot.handlers.handle_manual_dispatch(state)
+            if maintenance.is_schedule_like_manual_action(context.manual_action):
+                schedule_result = bot.handlers.handle_manual_dispatch_result(state)
+                state_changed = schedule_result.state_changed
+            else:
+                state_changed = bot.handlers.handle_manual_dispatch(state)
 
         elif event_name == "schedule":
             schedule_result = bot.handlers.handle_scheduled_check_result(state)
@@ -289,7 +299,7 @@ def execute_run(bot: AppExecutionRuntime, context: EventContext) -> ExecutionRes
                     "Acquire lock before mutating state."
                 )
 
-            if event_name == "schedule":
+            if schedule_result is not None:
                 current_active_reviews = state.get("active_reviews")
                 current_active_reviews_count = (
                     len(current_active_reviews) if isinstance(current_active_reviews, dict) else 0
@@ -297,13 +307,20 @@ def execute_run(bot: AppExecutionRuntime, context: EventContext) -> ExecutionRes
                 allow_empty_override = (
                     bot.get_config_value("ALLOW_EMPTY_ACTIVE_REVIEWS_WRITE").strip().lower() == "true"
                 )
+                allow_closed_cleanup_empty = (
+                    schedule_result is not None
+                    and loaded_active_reviews_count == len(loaded_active_review_numbers)
+                    and bool(loaded_active_review_numbers)
+                    and set(schedule_result.closed_cleanup_removed_items) == loaded_active_review_numbers
+                )
                 if (
                     loaded_active_reviews_count > 0
                     and current_active_reviews_count == 0
                     and not allow_empty_override
+                    and not allow_closed_cleanup_empty
                 ):
                     raise RuntimeError(
-                        "STATE_GUARD_BLOCKED_EMPTY_ACTIVE_REVIEWS: refusing to persist schedule "
+                        "STATE_GUARD_BLOCKED_EMPTY_ACTIVE_REVIEWS: refusing to persist maintenance "
                         f"state update that drops active_reviews from {loaded_active_reviews_count} "
                         "to 0. Set ALLOW_EMPTY_ACTIVE_REVIEWS_WRITE=true to override."
                     )

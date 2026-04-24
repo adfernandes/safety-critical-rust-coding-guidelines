@@ -1,3 +1,5 @@
+import pytest
+
 from scripts.reviewer_bot_lib import (
     lifecycle,
     maintenance,
@@ -136,7 +138,10 @@ def test_tracked_pr_repair_pass_collects_touched_items_and_clears_review_repair_
         lambda bot, issue_number, review_data: lifecycle.HeadObservationRepairResult(changed=False, outcome="unchanged"),
     )
 
-    assert maintenance_schedule._run_tracked_pr_repairs(bot, state) is True
+    changed, closed_cleanup_removed_items = maintenance_schedule._run_tracked_pr_maintenance(bot, state)
+
+    assert changed is True
+    assert closed_cleanup_removed_items == []
     assert bot.drain_touched_items() == [42]
     assert repair_records.load_repair_marker(review, "review_repair") is None
 
@@ -155,19 +160,29 @@ def test_finalize_schedule_result_drains_touched_items_for_projection_followup(m
     assert bot.drain_touched_items() == []
 
 
-def test_manual_dispatch_check_overdue_preserves_touched_items_for_projection_followup(monkeypatch):
+def test_manual_dispatch_check_overdue_rejects_unstructured_bool_path(monkeypatch):
     bot = FakeReviewerBotRuntime(monkeypatch)
     bot.ACTIVE_LEASE_CONTEXT = object()
     state = make_state()
     bot.set_config_value("MANUAL_ACTION", "check-overdue")
-    monkeypatch.setattr(
-        maintenance_schedule,
-        "handle_scheduled_check_result",
-        lambda runtime, current: maintenance.ScheduleHandlerResult(False, [42, 99]),
-    )
 
-    assert maintenance.handle_manual_dispatch(bot, state) is False
-    assert bot.drain_touched_items() == [42, 99]
+    with pytest.raises(RuntimeError, match="handle_manual_dispatch_result"):
+        maintenance.handle_manual_dispatch(bot, state)
+
+
+def test_manual_dispatch_result_routes_check_overdue_through_structured_schedule_result(monkeypatch):
+    bot = FakeReviewerBotRuntime(monkeypatch)
+    bot.ACTIVE_LEASE_CONTEXT = object()
+    state = make_state()
+    bot.set_config_value("MANUAL_ACTION", "check-overdue")
+    expected = maintenance.ScheduleHandlerResult(
+        state_changed=True,
+        touched_items=[42],
+        closed_cleanup_removed_items=(42,),
+    )
+    monkeypatch.setattr(maintenance, "handle_scheduled_check_result", lambda bot, state: expected)
+
+    assert maintenance.handle_manual_dispatch_result(bot, state) == expected
 
 
 def test_scheduled_check_collects_touched_item_for_warning_diagnostic_mutation(monkeypatch):

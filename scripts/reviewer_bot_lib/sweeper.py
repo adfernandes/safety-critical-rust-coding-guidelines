@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -14,22 +14,14 @@ from . import retrying
 from . import sweeper_observer_correlation as observer_correlation
 from .config import REVIEW_FRESHNESS_RUNBOOK_PATH
 from .review_state import (
-    accept_reviewer_review_from_live_review,
     get_current_cycle_boundary,
-    record_reviewer_activity,
-    refresh_reviewer_review_from_live_preferred_review,
     semantic_key_seen,
 )
-from .reviews import rebuild_pr_approval_state
 from .runtime_protocols import SweeperContext
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def _now_iso() -> str:
-    return _now().isoformat()
 
 
 def _retention_days(bot: SweeperContext) -> int:
@@ -93,7 +85,6 @@ def _sleep(bot: SweeperContext, seconds: float) -> None:
 _fetch_workflow_runs_for_file = observer_correlation.fetch_workflow_runs_for_file
 _fetch_run_detail = observer_correlation.fetch_run_detail
 inspect_run_artifact_payloads = observer_correlation.inspect_run_artifact_payloads
-_update_observer_watermark = observer_correlation.update_observer_watermark
 
 
 def _complete_surface_scan(bot, review_data: dict, surface: str, discovered: list[dict]) -> None:
@@ -102,10 +93,7 @@ def _complete_surface_scan(bot, review_data: dict, surface: str, discovered: lis
         review_data,
         surface,
         discovered,
-        _load_surface_watermark,
     )
-
-
 
 
 def _diagnose_deferred_event(
@@ -121,7 +109,7 @@ def _diagnose_deferred_event(
     source_event_kind: str,
     workflow_runs: list[dict] | None,
 ) -> None:
-    existing_gap = review_data.get("deferred_gaps", {}).get(source_event_key, {})
+    existing_gap = gap_bookkeeping.get_deferred_gap(review_data, source_event_key)
     run_correlation = deferred_gap_diagnosis.correlate_candidate_observer_runs(
         source_event_key,
         source_event_kind=source_event_kind,
@@ -174,33 +162,6 @@ def _diagnose_deferred_event(
     )
 
 
-def _load_surface_watermark(review_data: dict, surface: str) -> dict:
-    watermarks = gap_bookkeeping._observer_discovery_watermarks(review_data)
-    current = watermarks.get(surface)
-    if isinstance(current, dict):
-        return current
-    current = {
-        "last_scan_started_at": None,
-        "last_scan_completed_at": None,
-        "last_safe_event_time": None,
-        "last_safe_event_id": None,
-        "lookback_seconds": None,
-        "bootstrap_window_seconds": None,
-        "bootstrap_completed_at": None,
-    }
-    watermarks[surface] = current
-    return current
-
-
-def _surface_scan_floor(bot, watermark: dict) -> datetime:
-    now = _now()
-    bootstrap_floor = now - timedelta(seconds=bot.DEFERRED_DISCOVERY_BOOTSTRAP_WINDOW_SECONDS)
-    safe_time = parse_timestamp(watermark.get("last_safe_event_time"))
-    if safe_time is None:
-        return bootstrap_floor
-    return max(bootstrap_floor, safe_time - timedelta(seconds=bot.DEFERRED_DISCOVERY_OVERLAP_SECONDS))
-
-
 def _list_issue_comments_paginated(bot, issue_number: int) -> tuple[list[dict] | None, bool]:
     comments: list[dict] = []
     page = 1
@@ -231,6 +192,21 @@ def _list_review_comments_paginated(bot, issue_number: int) -> tuple[list[dict] 
         page += 1
 
 
+def _list_timeline_events_paginated(bot, issue_number: int) -> tuple[list[dict] | None, bool]:
+    events: list[dict] = []
+    page = 1
+    while True:
+        response, _ = _read_api_payload(bot, f"issues/{issue_number}/timeline?per_page=100&page={page}")
+        if response is None:
+            return None, False
+        if not isinstance(response, list):
+            return None, False
+        events.extend([event for event in response if isinstance(event, dict)])
+        if len(response) < 100:
+            return events, True
+        page += 1
+
+
 def _is_automation_comment(comment: dict) -> bool:
     user = comment.get("user") if isinstance(comment, dict) else None
     login = user.get("login") if isinstance(user, dict) else None
@@ -253,18 +229,14 @@ def _fetch_live_issue_comment(bot, comment_id: str) -> dict | None:
     return response if isinstance(response, dict) else None
 
 
-def _purge_bot_authored_comment_gap(bot, review_data: dict, source_event_key: str) -> bool:
+def _clear_bot_authored_comment_false_positive(bot, review_data: dict, source_event_key: str) -> bool:
     if not source_event_key.startswith("issue_comment:"):
         return False
     comment_id = source_event_key.split(":", 1)[1]
     live_comment = _fetch_live_issue_comment(bot, comment_id)
     if not isinstance(live_comment, dict) or not _is_automation_comment(live_comment):
         return False
-    deferred_gaps = gap_bookkeeping._deferred_gaps(review_data)
-    if source_event_key not in deferred_gaps:
-        return False
-    deferred_gaps.pop(source_event_key, None)
-    return True
+    return gap_bookkeeping.clear_automation_comment_false_positive(review_data, source_event_key)
 
 
 def _maybe_fetch_single_candidate_run_detail(bot, run_correlation: dict, artifact_correlation: dict | None) -> dict | None:
@@ -285,40 +257,11 @@ def _maybe_fetch_single_candidate_run_detail(bot, run_correlation: dict, artifac
     return _fetch_run_detail(bot, run_id)
 
 
-def _repair_visible_review_gap(bot, review_data: dict, issue_number: int, source_event_key: str, review: dict) -> bool:
-    repair = deferred_gap_diagnosis.recommend_review_submission_gap_repair(
-        review_data,
-        review,
-        source_event_key,
-        artifact_status=None,
-        current_cycle_boundary=get_current_cycle_boundary(bot, review_data),
-    )
-    if repair is None:
-        return False
-    payload = repair["payload"]
-    author = str(payload["author"])
-    submitted_at = str(payload["submitted_at"])
-    changed = accept_reviewer_review_from_live_review(review_data, review, actor=author)
-    changed = refresh_reviewer_review_from_live_preferred_review(
-        bot,
-        issue_number,
-        review_data,
-        actor=author,
-    )[0] or changed
-    record_reviewer_activity(review_data, submitted_at)
-    completion, _ = rebuild_pr_approval_state(bot, issue_number, review_data)
-    reconciled_changed = gap_bookkeeping._mark_reconciled_source_event(review_data, source_event_key)
-    gap_cleared_changed = gap_bookkeeping._clear_source_event_key(review_data, source_event_key)
-    return changed or completion is not None or reconciled_changed or gap_cleared_changed
-
-
 def _discover_visible_comment_events(bot, issue_number: int, review_data: dict) -> tuple[list[dict] | None, bool]:
-    watermark = _load_surface_watermark(review_data, "comments")
-    watermark["last_scan_started_at"] = _now_iso()
+    floor = gap_bookkeeping.begin_observer_surface_scan(bot, review_data, "comments", now=_now())
     comments, complete = _list_issue_comments_paginated(bot, issue_number)
     if comments is None:
         return None, False
-    floor = _surface_scan_floor(bot, watermark)
     discovered: list[dict] = []
     for comment in comments:
         if _is_automation_comment(comment):
@@ -345,12 +288,10 @@ def _discover_visible_comment_events(bot, issue_number: int, review_data: dict) 
 
 
 def _discover_visible_review_events(bot, issue_number: int, review_data: dict) -> tuple[list[dict] | None, bool]:
-    watermark = _load_surface_watermark(review_data, "reviews_submitted")
-    watermark["last_scan_started_at"] = _now_iso()
+    floor = gap_bookkeeping.begin_observer_surface_scan(bot, review_data, "reviews_submitted", now=_now())
     reviews = bot.github.get_pull_request_reviews(issue_number)
     if reviews is None:
         return None, False
-    floor = _surface_scan_floor(bot, watermark)
     discovered: list[dict] = []
     for review in reviews:
         review_id = review.get("id") if isinstance(review, dict) else None
@@ -378,12 +319,10 @@ def _discover_visible_review_events(bot, issue_number: int, review_data: dict) -
 
 
 def _discover_visible_review_comment_events(bot, issue_number: int, review_data: dict) -> tuple[list[dict] | None, bool]:
-    watermark = _load_surface_watermark(review_data, "review_comments")
-    watermark["last_scan_started_at"] = _now_iso()
+    floor = gap_bookkeeping.begin_observer_surface_scan(bot, review_data, "review_comments", now=_now())
     comments, complete = _list_review_comments_paginated(bot, issue_number)
     if comments is None:
         return None, False
-    floor = _surface_scan_floor(bot, watermark)
     discovered: list[dict] = []
     for comment in comments:
         if not isinstance(comment, dict) or _is_automation_comment(comment):
@@ -410,21 +349,17 @@ def _discover_visible_review_comment_events(bot, issue_number: int, review_data:
 
 
 def _discover_visible_review_dismissal_events(bot, issue_number: int, review_data: dict) -> tuple[list[dict] | None, bool]:
-    watermark = _load_surface_watermark(review_data, "reviews_dismissed")
-    watermark["last_scan_started_at"] = _now_iso()
-    reviews = bot.github.get_pull_request_reviews(issue_number)
-    if reviews is None:
+    floor = gap_bookkeeping.begin_observer_surface_scan(bot, review_data, "reviews_dismissed", now=_now())
+    timeline_events, complete = _list_timeline_events_paginated(bot, issue_number)
+    if timeline_events is None:
         return None, False
-    floor = _surface_scan_floor(bot, watermark)
     discovered: list[dict] = []
-    for review in reviews:
-        if not isinstance(review, dict):
+    for event in timeline_events:
+        if event.get("event") != "review_dismissed":
             continue
-        review_id = review.get("id")
-        state = str(review.get("state", "")).strip().upper()
-        dismissed_at = review.get("dismissed_at") or review.get("updated_at") or review.get("submitted_at")
-        if state != "DISMISSED":
-            continue
+        dismissed_review = event.get("dismissed_review")
+        review_id = dismissed_review.get("review_id") if isinstance(dismissed_review, dict) else None
+        dismissed_at = event.get("created_at")
         if not isinstance(review_id, int) or not isinstance(dismissed_at, str):
             continue
         dismissed_dt = parse_timestamp(dismissed_at)
@@ -440,7 +375,7 @@ def _discover_visible_review_dismissal_events(bot, issue_number: int, review_dat
                 "surface": "reviews_dismissed",
             }
         )
-    return discovered, True
+    return discovered, complete
 
 
 def _record_gap_diagnostics(
@@ -459,7 +394,7 @@ def _record_gap_diagnostics(
     reason: str,
     diagnostic_reason: str,
 ) -> None:
-    gap_bookkeeping._update_deferred_gap(
+    gap_bookkeeping.record_deferred_gap_diagnostic(
         bot,
         review_data,
         {
@@ -475,28 +410,28 @@ def _record_gap_diagnostics(
         reason,
         f"Trusted sweeper diagnostics for {source_event_key}: {diagnostic_reason}. See {bot.REVIEW_FRESHNESS_RUNBOOK_PATH}.",
     )
-    gap = gap_bookkeeping._deferred_gaps(review_data)[source_event_key]
-    gap["full_scan_complete"] = bool(run_correlation.get("full_scan_complete"))
-    gap["later_recheck_complete"] = bool(run_correlation.get("later_recheck_complete"))
-    gap["correlated_run_found"] = bool(run_correlation.get("correlated_run"))
+    gap_fields = {
+        "full_scan_complete": bool(run_correlation.get("full_scan_complete")),
+        "later_recheck_complete": bool(run_correlation.get("later_recheck_complete")),
+        "correlated_run_found": bool(run_correlation.get("correlated_run")),
+    }
     raw_candidate_run_ids = run_correlation.get("candidate_run_ids")
     if isinstance(raw_candidate_run_ids, list):
-        gap["candidate_run_ids"] = raw_candidate_run_ids
+        gap_fields["candidate_run_ids"] = raw_candidate_run_ids
     if isinstance(run_detail, dict):
-        gap["run_created_at"] = run_detail.get("created_at")
+        gap_fields["run_created_at"] = run_detail.get("created_at")
     if isinstance(artifact_correlation, dict):
         prior_visibility = artifact_correlation.get("prior_visibility", {}).get(run_correlation.get("correlated_run"), {})
         if isinstance(prior_visibility, dict):
-            gap.update(prior_visibility)
+            gap_fields.update(prior_visibility)
+    gap_bookkeeping.update_deferred_gap_fields(review_data, source_event_key, gap_fields)
 
 
 def _should_skip_discovered_key(bot, review_data: dict, source_event_key: str, channels: tuple[str, ...]) -> bool:
-    if gap_bookkeeping._was_reconciled_source_event(review_data, source_event_key):
+    if gap_bookkeeping.was_reconciled_source_event(review_data, source_event_key):
         return True
-    deferred_gaps = gap_bookkeeping._deferred_gaps(review_data)
-    if source_event_key in deferred_gaps:
-        existing_gap = deferred_gaps.get(source_event_key)
-        if isinstance(existing_gap, dict) and existing_gap.get("reason") in {
+    if source_event_key in gap_bookkeeping.list_deferred_gap_keys(review_data):
+        if gap_bookkeeping.get_deferred_gap_reason(review_data, source_event_key) in {
             "awaiting_observer_run",
             "awaiting_observer_approval",
             "observer_in_progress",
@@ -525,9 +460,8 @@ def sweep_deferred_gaps(bot, state: dict) -> bool:
         pull_request, _ = _read_api_payload(bot, f"pulls/{issue_number}")
         if not isinstance(pull_request, dict) or str(pull_request.get("state", "")).lower() != "open":
             continue
-        deferred_gaps = gap_bookkeeping._deferred_gaps(review_data)
-        for source_event_key in list(deferred_gaps):
-            if _purge_bot_authored_comment_gap(bot, review_data, source_event_key):
+        for source_event_key in gap_bookkeeping.list_deferred_gap_keys(review_data):
+            if _clear_bot_authored_comment_false_positive(bot, review_data, source_event_key):
                 changed = True
         discovered_comments, comments_complete = _discover_visible_comment_events(bot, issue_number, review_data)
         if comments_complete and isinstance(discovered_comments, list):
@@ -559,7 +493,7 @@ def sweep_deferred_gaps(bot, state: dict) -> bool:
                 submitted_at = discovered["source_created_at"]
                 if _should_skip_discovered_key(bot, review_data, source_event_key, ("reviewer_review",)):
                     continue
-                existing_gap = gap_bookkeeping._deferred_gaps(review_data).get(source_event_key, {})
+                existing_gap = gap_bookkeeping.get_deferred_gap(review_data, source_event_key)
                 workflow_file = ".github/workflows/reviewer-bot-pr-review-submitted-observer.yml"
                 workflow_runs = _fetch_workflow_runs_for_file(bot, workflow_file, "pull_request_review")
                 run_correlation = deferred_gap_diagnosis.correlate_candidate_observer_runs(
@@ -589,22 +523,13 @@ def sweep_deferred_gaps(bot, state: dict) -> bool:
                     run_detail = _maybe_fetch_single_candidate_run_detail(bot, run_correlation, artifact_correlation)
                 review_payload = discovered.get("review") if isinstance(discovered.get("review"), dict) else None
                 artifact_status = artifact_correlation.get("status") if isinstance(artifact_correlation, dict) else None
-                repair_recommendation = deferred_gap_diagnosis.recommend_review_submission_gap_repair(
+                visible_review_diagnostic = deferred_gap_diagnosis.describe_review_submission_gap_diagnostic(
                     review_data,
                     review_payload,
                     source_event_key,
                     artifact_status=artifact_status,
                     current_cycle_boundary=get_current_cycle_boundary(bot, review_data),
                 )
-                if repair_recommendation is not None and _repair_visible_review_gap(
-                    bot,
-                    review_data,
-                    issue_number,
-                    source_event_key,
-                    review_payload,
-                ):
-                    changed = True
-                    continue
                 reason, diagnostic_reason = deferred_gap_diagnosis.evaluate_deferred_gap_state(
                     {
                         **existing_gap,
@@ -615,6 +540,8 @@ def sweep_deferred_gaps(bot, state: dict) -> bool:
                     artifact_correlation,
                     runbook_signature=_approval_pending_signature_from_runbook(),
                 )
+                if visible_review_diagnostic is not None:
+                    diagnostic_reason = f"{diagnostic_reason}; {visible_review_diagnostic['category']}"
                 _record_gap_diagnostics(
                     bot,
                     review_data,
@@ -630,15 +557,17 @@ def sweep_deferred_gaps(bot, state: dict) -> bool:
                     reason=reason,
                     diagnostic_reason=diagnostic_reason,
                 )
+                if visible_review_diagnostic is not None:
+                    gap_bookkeeping.update_deferred_gap_fields(
+                        review_data,
+                        source_event_key,
+                        {"visible_review_diagnostic": visible_review_diagnostic},
+                    )
                 changed = True
             if discovered_reviews:
-                last_review = discovered_reviews[-1]
-                _update_observer_watermark(bot, review_data, "reviews_submitted", last_review["source_created_at"], last_review["object_id"])
+                _complete_surface_scan(bot, review_data, "reviews_submitted", discovered_reviews)
             else:
-                watermark = _load_surface_watermark(review_data, "reviews_submitted")
-                watermark["last_scan_started_at"] = watermark.get("last_scan_started_at") or _now_iso()
-                watermark["last_scan_completed_at"] = _now_iso()
-                watermark["bootstrap_completed_at"] = watermark.get("bootstrap_completed_at") or _now_iso()
+                gap_bookkeeping.record_observer_watermark_empty_scan(bot, review_data, "reviews_submitted")
         discovered_review_comments, review_comments_complete = _discover_visible_review_comment_events(bot, issue_number, review_data)
         if review_comments_complete and isinstance(discovered_review_comments, list):
             for discovered in discovered_review_comments:

@@ -52,6 +52,9 @@ from .reconcile_reads import (
 from .reconcile_reads import (
     read_reconcile_reviews as _read_reconcile_reviews,
 )
+from .reconcile_reads import (
+    resolve_review_dismissal_time as _resolve_review_dismissal_time,
+)
 from .review_state import (
     accept_channel_event,
     ensure_review_entry,
@@ -77,6 +80,14 @@ class WorkflowRunHandlerResult:
 
 def _log(bot: ReconcileWorkflowRuntimeContext, level: str, message: str, **fields) -> None:
     bot.logger.event(level, message, **fields)
+
+
+def _read_live_pr_state_for_reconcile(bot: ReconcileWorkflowRuntimeContext, pr_number: int) -> str:
+    live_pr = _read_reconcile_object(bot, f"pulls/{pr_number}", label=f"live PR #{pr_number}")
+    live_state = live_pr.get("state")
+    if not isinstance(live_state, str) or not live_state.strip():
+        raise ReconcileReadError(f"live PR #{pr_number} state is invalid", failure_kind="invalid_payload")
+    return live_state.strip().lower()
 
 
 def _now_iso(bot: ReconcileWorkflowRuntimeContext) -> str:
@@ -270,7 +281,7 @@ def _reconcile_deferred_comment(
         )
 
     def record_artifact_invalid(problem: InvalidEventInput) -> bool:
-        return gap_bookkeeping._update_deferred_gap(
+        return gap_bookkeeping.record_deferred_gap_diagnostic(
             bot,
             review_data,
             payload,
@@ -298,7 +309,7 @@ def _reconcile_deferred_comment(
                 changed = record_conversation_freshness(bot, state, replay_request())
             except InvalidEventInput as exc:
                 return record_artifact_invalid(exc)
-        gap_changed = gap_bookkeeping._update_deferred_gap(
+        gap_changed = gap_bookkeeping.record_deferred_gap_diagnostic(
             bot,
             review_data,
             payload,
@@ -334,7 +345,7 @@ def _reconcile_deferred_comment(
                 changed = record_conversation_freshness(bot, state, replay_request(comment_context, comment_body=live_body))
             except InvalidEventInput as exc:
                 return record_artifact_invalid(exc)
-        gap_changed = gap_bookkeeping._update_deferred_gap(
+        gap_changed = gap_bookkeeping.record_deferred_gap_diagnostic(
             bot,
             review_data,
             payload,
@@ -360,7 +371,7 @@ def _reconcile_deferred_comment(
         except InvalidEventInput as exc:
             return record_artifact_invalid(exc)
     if decision.failed_closed_reason is not None:
-        gap_changed = gap_bookkeeping._update_deferred_gap(
+        gap_changed = gap_bookkeeping.record_deferred_gap_diagnostic(
             bot,
             review_data,
             payload,
@@ -382,14 +393,14 @@ def _reconcile_deferred_comment(
             return record_artifact_invalid(exc)
     reconciled_changed = False
     if decision.mark_reconciled:
-        reconciled_changed = gap_bookkeeping._mark_reconciled_source_event(
+        reconciled_changed = gap_bookkeeping.mark_reconciled_source_event(
             review_data,
             str(payload.get("source_event_key", "")),
             reconciled_at=_now_iso(bot),
         )
         gap_cleared_changed = False
         if decision.clear_gap:
-            gap_cleared_changed = gap_bookkeeping._clear_source_event_key(review_data, str(payload.get("source_event_key", "")))
+            gap_cleared_changed = gap_bookkeeping.clear_deferred_gap(review_data, str(payload.get("source_event_key", "")))
         return changed or reconciled_changed or gap_cleared_changed
 
 
@@ -471,12 +482,12 @@ def _handle_review_submitted_workflow_run(
         state_changed = True
     if _record_review_rebuild(bot, state, pr_number, review_data):
         state_changed = True
-    reconciled_changed = gap_bookkeeping._mark_reconciled_source_event(
+    reconciled_changed = gap_bookkeeping.mark_reconciled_source_event(
         review_data,
         source_event_key,
         reconciled_at=_now_iso(bot),
     )
-    gap_cleared_changed = gap_bookkeeping._clear_source_event_key(review_data, source_event_key)
+    gap_cleared_changed = gap_bookkeeping.clear_deferred_gap(review_data, source_event_key)
     return state_changed or reconciled_changed or gap_cleared_changed
 
 
@@ -492,27 +503,51 @@ def _handle_review_dismissed_workflow_run(
         expected_event_action="dismissed",
     )
     source_event_key = context.source_event_key
+    dismissal_time = _resolve_review_dismissal_time(
+        bot,
+        context.pr_number,
+        context.review_id,
+        parsed_payload.raw_payload,
+    )
+    if not dismissal_time.exact:
+        return gap_bookkeeping.record_deferred_gap_diagnostic(
+            bot,
+            review_data,
+            parsed_payload.raw_payload,
+            "reconcile_failed_closed",
+            (
+                f"Deferred review dismissal {context.review_id} lacks exact source dismissal time; "
+                f"dismissal replay suppressed ({dismissal_time.reason or 'unavailable'}). "
+                f"See {bot.REVIEW_FRESHNESS_RUNBOOK_PATH}."
+            ),
+            failure_kind=dismissal_time.failure_kind,
+        )
     decision = reconcile_replay_policy.decide_review_dismissed_replay(
         source_event_key=source_event_key,
-        timestamp=_now_iso(bot),
+        timestamp=str(dismissal_time.timestamp),
     )
+    state_changed = False
     if decision.accept_review_dismissal:
-        accept_channel_event(
+        state_changed = accept_channel_event(
             review_data,
             "review_dismissal",
             semantic_key=source_event_key,
             timestamp=str(decision.replay_timestamp),
             dismissal_only=True,
+        ) or state_changed
+    state_changed = bot.adapters.review_state.maybe_record_head_observation_repair(context.pr_number, review_data).changed or state_changed
+    state_changed = _record_review_rebuild(bot, state, context.pr_number, review_data) or state_changed
+    reconciled_changed = False
+    if decision.mark_reconciled:
+        reconciled_changed = gap_bookkeeping.mark_reconciled_source_event(
+            review_data,
+            source_event_key,
+            reconciled_at=_now_iso(bot),
         )
-    bot.adapters.review_state.maybe_record_head_observation_repair(context.pr_number, review_data)
-    _record_review_rebuild(bot, state, context.pr_number, review_data)
-    gap_bookkeeping._mark_reconciled_source_event(
-        review_data,
-        source_event_key,
-        reconciled_at=_now_iso(bot),
-    )
-    gap_bookkeeping._clear_source_event_key(review_data, source_event_key)
-    return True
+    gap_cleared_changed = False
+    if decision.clear_gap:
+        gap_cleared_changed = gap_bookkeeping.clear_deferred_gap(review_data, source_event_key)
+    return state_changed or reconciled_changed or gap_cleared_changed
 
 
 _WORKFLOW_RUN_HANDLER_MATRIX: dict[tuple[str, str], tuple[type[DeferredCommentPayload] | type[DeferredReviewPayload], object]] = {
@@ -566,16 +601,39 @@ def handle_workflow_run_event_result(bot: ReconcileWorkflowRuntimeContext, state
         raise RuntimeError("Deferred context is missing a valid PR number")
     review_data = ensure_review_entry(state, pr_number)
     if review_data is None:
-        raise RuntimeError(f"No active review entry available for PR #{pr_number}")
-    bot.collect_touched_item(pr_number)
+        _log(
+            bot,
+            "info",
+            f"Ignoring deferred workflow_run for missing active review entry on PR #{pr_number}",
+            issue_number=pr_number,
+            source_event_key=parsed_payload.identity.source_event_key,
+        )
+        return WorkflowRunHandlerResult(False, [])
     try:
+        live_pr_state = _read_live_pr_state_for_reconcile(bot, pr_number)
+        if live_pr_state == "closed":
+            _log(
+                bot,
+                "info",
+                f"Ignoring deferred workflow_run for closed PR #{pr_number}",
+                issue_number=pr_number,
+                source_event_key=parsed_payload.identity.source_event_key,
+            )
+            return WorkflowRunHandlerResult(False, [])
+        if live_pr_state != "open":
+            raise ReconcileReadError(
+                f"live PR #{pr_number} state is unsupported for replay: {live_pr_state}",
+                failure_kind="invalid_payload",
+            )
+        bot.collect_touched_item(pr_number)
         handler = _workflow_run_handler_for_payload(parsed_payload)
         if handler is None:
             raise RuntimeError("Unsupported deferred workflow_run payload")
         return _build_result(handler(bot, state, review_data, parsed_payload), pr_number)
     except RuntimeError as exc:
+        bot.collect_touched_item(pr_number)
         failure_kind = exc.failure_kind if isinstance(exc, ReconcileReadError) else None
-        gap_changed = gap_bookkeeping._update_deferred_gap(
+        gap_changed = gap_bookkeeping.record_deferred_gap_diagnostic(
             bot,
             review_data,
             payload,

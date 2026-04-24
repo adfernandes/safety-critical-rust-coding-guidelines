@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 
 def _sidecars(review_data: dict) -> dict:
@@ -23,10 +23,6 @@ def _deferred_gaps(review_data: dict) -> dict:
     return deferred_gaps
 
 
-def get_deferred_gaps(review_data: dict) -> dict:
-    return _deferred_gaps(review_data)
-
-
 def _reconciled_source_events(review_data: dict) -> dict:
     sidecars = _sidecars(review_data)
     reconciled = sidecars.get("reconciled_source_events")
@@ -34,10 +30,6 @@ def _reconciled_source_events(review_data: dict) -> dict:
         reconciled = {}
         sidecars["reconciled_source_events"] = reconciled
     return reconciled
-
-
-def get_reconciled_source_events(review_data: dict) -> dict:
-    return _reconciled_source_events(review_data)
 
 
 def _observer_discovery_watermarks(review_data: dict) -> dict:
@@ -49,8 +41,114 @@ def _observer_discovery_watermarks(review_data: dict) -> dict:
     return watermarks
 
 
-def get_observer_discovery_watermarks(review_data: dict) -> dict:
-    return _observer_discovery_watermarks(review_data)
+def _ensure_observer_discovery_watermark(review_data: dict, surface: str) -> dict:
+    watermarks = _observer_discovery_watermarks(review_data)
+    current = watermarks.get(surface)
+    if isinstance(current, dict):
+        return current
+    current = {
+        "last_scan_started_at": None,
+        "last_scan_completed_at": None,
+        "last_safe_event_time": None,
+        "last_safe_event_id": None,
+        "lookback_seconds": None,
+        "bootstrap_window_seconds": None,
+        "bootstrap_completed_at": None,
+    }
+    watermarks[surface] = current
+    return current
+
+
+def _observer_now_iso(bot) -> str:
+    return _now_iso(bot)
+
+
+def _parse_observer_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if timestamp.tzinfo is None:
+        return timestamp.replace(tzinfo=timezone.utc)
+    return timestamp
+
+
+def _configured_seconds(bot, name: str, default: int) -> int:
+    value = getattr(bot, name, default)
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return default
+    return seconds if seconds >= 0 else default
+
+
+def begin_observer_surface_scan(
+    bot,
+    review_data: dict,
+    surface: str,
+    *,
+    now: datetime | None = None,
+) -> datetime:
+    watermark = _ensure_observer_discovery_watermark(review_data, surface)
+    scan_started_at = now or bot.clock.now()
+    if scan_started_at.tzinfo is None:
+        scan_started_at = scan_started_at.replace(tzinfo=timezone.utc)
+    lookback_seconds = _configured_seconds(bot, "DEFERRED_DISCOVERY_OVERLAP_SECONDS", 3600)
+    bootstrap_window_seconds = _configured_seconds(bot, "DEFERRED_DISCOVERY_BOOTSTRAP_WINDOW_SECONDS", 604800)
+    watermark.update(
+        {
+            "last_scan_started_at": scan_started_at.isoformat(),
+            "lookback_seconds": lookback_seconds,
+            "bootstrap_window_seconds": bootstrap_window_seconds,
+        }
+    )
+    bootstrap_floor = scan_started_at - timedelta(seconds=bootstrap_window_seconds)
+    safe_time = _parse_observer_timestamp(watermark.get("last_safe_event_time"))
+    if safe_time is None:
+        return bootstrap_floor
+    return max(bootstrap_floor, safe_time - timedelta(seconds=lookback_seconds))
+
+
+def record_observer_watermark_event(bot, review_data: dict, surface: str, event_time: str, event_id: str) -> None:
+    current = _ensure_observer_discovery_watermark(review_data, surface)
+    now = _observer_now_iso(bot)
+    current.update(
+        {
+            "last_scan_started_at": current.get("last_scan_started_at") or now,
+            "last_scan_completed_at": now,
+            "last_safe_event_time": event_time,
+            "last_safe_event_id": event_id,
+            "lookback_seconds": _configured_seconds(bot, "DEFERRED_DISCOVERY_OVERLAP_SECONDS", 3600),
+            "bootstrap_window_seconds": _configured_seconds(bot, "DEFERRED_DISCOVERY_BOOTSTRAP_WINDOW_SECONDS", 604800),
+            "bootstrap_completed_at": current.get("bootstrap_completed_at") or now,
+        }
+    )
+
+
+def record_observer_watermark_empty_scan(bot, review_data: dict, surface: str) -> None:
+    watermark = _ensure_observer_discovery_watermark(review_data, surface)
+    now = _observer_now_iso(bot)
+    watermark["last_scan_started_at"] = watermark.get("last_scan_started_at") or now
+    watermark["last_scan_completed_at"] = now
+    watermark["lookback_seconds"] = _configured_seconds(bot, "DEFERRED_DISCOVERY_OVERLAP_SECONDS", 3600)
+    watermark["bootstrap_window_seconds"] = _configured_seconds(bot, "DEFERRED_DISCOVERY_BOOTSTRAP_WINDOW_SECONDS", 604800)
+    watermark["bootstrap_completed_at"] = watermark.get("bootstrap_completed_at") or now
+
+
+def list_deferred_gap_keys(review_data: dict) -> list[str]:
+    return list(_deferred_gaps(review_data))
+
+
+def get_deferred_gap(review_data: dict, source_event_key: str) -> dict:
+    gap = _deferred_gaps(review_data).get(source_event_key)
+    return gap if isinstance(gap, dict) else {}
+
+
+def get_deferred_gap_reason(review_data: dict, source_event_key: str) -> str | None:
+    reason = get_deferred_gap(review_data, source_event_key).get("reason")
+    return reason if isinstance(reason, str) else None
 
 
 def _now_iso(bot) -> str:
@@ -61,7 +159,16 @@ def _reconciled_at_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _ensure_source_event_key(review_data: dict, source_event_key: str, payload: dict | None = None) -> None:
+def _is_valid_reconciled_source_event(existing: object, source_event_key: str) -> bool:
+    if not isinstance(existing, dict):
+        return False
+    if existing.get("source_event_key") != source_event_key:
+        return False
+    reconciled_at = existing.get("reconciled_at")
+    return isinstance(reconciled_at, str) and bool(reconciled_at.strip())
+
+
+def record_deferred_gap_payload(review_data: dict, source_event_key: str, payload: dict | None = None) -> None:
     deferred_gaps = _deferred_gaps(review_data)
     if payload is None:
         payload = {}
@@ -69,7 +176,7 @@ def _ensure_source_event_key(review_data: dict, source_event_key: str, payload: 
     deferred_gaps[source_event_key] = payload
 
 
-def _clear_source_event_key(review_data: dict, source_event_key: str) -> bool:
+def clear_deferred_gap(review_data: dict, source_event_key: str) -> bool:
     deferred_gaps = _deferred_gaps(review_data)
     if source_event_key in deferred_gaps:
         deferred_gaps.pop(source_event_key, None)
@@ -77,7 +184,24 @@ def _clear_source_event_key(review_data: dict, source_event_key: str) -> bool:
     return False
 
 
-def _mark_reconciled_source_event(
+def clear_automation_comment_false_positive(review_data: dict, source_event_key: str) -> bool:
+    """Clear only known self-authored issue-comment observer false positives."""
+    if not source_event_key.startswith("issue_comment:"):
+        return False
+    return clear_deferred_gap(review_data, source_event_key)
+
+
+def update_deferred_gap_fields(review_data: dict, source_event_key: str, fields: dict) -> bool:
+    deferred_gaps = _deferred_gaps(review_data)
+    existing = deferred_gaps.get(source_event_key)
+    if not isinstance(existing, dict):
+        return False
+    previous = deepcopy(existing)
+    existing.update(fields)
+    return previous != existing
+
+
+def mark_reconciled_source_event(
     review_data: dict,
     source_event_key: str,
     *,
@@ -87,7 +211,7 @@ def _mark_reconciled_source_event(
     timestamp = reconciled_at or _reconciled_at_now()
     existing = reconciled.get(source_event_key)
     if isinstance(existing, dict):
-        if existing.get("source_event_key") != source_event_key or not existing.get("reconciled_at"):
+        if not _is_valid_reconciled_source_event(existing, source_event_key):
             existing["source_event_key"] = source_event_key
             existing["reconciled_at"] = timestamp
             return True
@@ -99,8 +223,11 @@ def _mark_reconciled_source_event(
     return True
 
 
-def _was_reconciled_source_event(review_data: dict, source_event_key: str) -> bool:
-    return source_event_key in _reconciled_source_events(review_data)
+def was_reconciled_source_event(review_data: dict, source_event_key: str) -> bool:
+    return _is_valid_reconciled_source_event(
+        _reconciled_source_events(review_data).get(source_event_key),
+        source_event_key,
+    )
 
 
 def _payload_or_existing(payload: dict, existing: dict, key: str):
@@ -108,7 +235,16 @@ def _payload_or_existing(payload: dict, existing: dict, key: str):
     return existing.get(key) if value is None else value
 
 
-def _update_deferred_gap(
+def _source_event_created_at(payload: dict, existing: dict):
+    return (
+        payload.get("source_created_at")
+        or payload.get("source_submitted_at")
+        or payload.get("source_dismissed_at")
+        or existing.get("source_event_created_at")
+    )
+
+
+def record_deferred_gap_diagnostic(
     bot,
     review_data: dict,
     payload: dict,
@@ -125,24 +261,26 @@ def _update_deferred_gap(
     if not isinstance(existing, dict):
         existing = {}
     previous = deepcopy(existing)
-    existing.update(
-        {
-            "source_event_key": source_event_key,
-            "source_event_kind": f"{payload.get('source_event_name')}:{payload.get('source_event_action')}",
-            "pr_number": payload.get("pr_number"),
-            "reason": reason,
-            "source_event_created_at": payload.get("source_created_at") or payload.get("source_submitted_at"),
-            "source_run_id": _payload_or_existing(payload, existing, "source_run_id"),
-            "source_run_attempt": _payload_or_existing(payload, existing, "source_run_attempt"),
-            "source_workflow_file": _payload_or_existing(payload, existing, "source_workflow_file"),
-            "source_artifact_name": _payload_or_existing(payload, existing, "source_artifact_name"),
-            "first_noted_at": existing.get("first_noted_at") or _now_iso(bot),
-            "last_checked_at": _now_iso(bot),
-            "operator_action_required": True,
-            "diagnostic_summary": diagnostic_summary,
-            "failure_kind": failure_kind,
-        }
-    )
+    fields = {
+        "source_event_key": source_event_key,
+        "source_event_kind": f"{payload.get('source_event_name')}:{payload.get('source_event_action')}",
+        "pr_number": payload.get("pr_number"),
+        "reason": reason,
+        "source_event_created_at": _source_event_created_at(payload, existing),
+        "source_run_id": _payload_or_existing(payload, existing, "source_run_id"),
+        "source_run_attempt": _payload_or_existing(payload, existing, "source_run_attempt"),
+        "source_workflow_file": _payload_or_existing(payload, existing, "source_workflow_file"),
+        "source_artifact_name": _payload_or_existing(payload, existing, "source_artifact_name"),
+        "first_noted_at": existing.get("first_noted_at") or _now_iso(bot),
+        "last_checked_at": _now_iso(bot),
+        "operator_action_required": True,
+        "diagnostic_summary": diagnostic_summary,
+        "failure_kind": failure_kind,
+    }
+    source_dismissed_at = _payload_or_existing(payload, existing, "source_dismissed_at")
+    if source_dismissed_at is not None:
+        fields["source_dismissed_at"] = source_dismissed_at
+    existing.update(fields)
     changed = previous != existing
     deferred_gaps[source_event_key] = existing
     return changed

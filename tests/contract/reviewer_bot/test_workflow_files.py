@@ -99,6 +99,15 @@ def test_pr_metadata_workflow_exports_raw_timestamp_boundary_fields():
     assert "EVENT_CREATED_AT: ${{ github.event.pull_request.updated_at }}" not in workflow_text
 
 
+def test_reconcile_workflow_permissions_cover_live_replay_reads():
+    workflow = yaml.safe_load(Path(".github/workflows/reviewer-bot-reconcile.yml").read_text(encoding="utf-8"))
+    permissions = workflow["jobs"]["reconcile"]["permissions"]
+
+    assert permissions["actions"] == "read"
+    assert permissions["issues"] in {"read", "write"}
+    assert permissions["pull-requests"] in {"read", "write"}
+
+
 @pytest.mark.parametrize(
     "workflow_path",
     [
@@ -457,3 +466,15 @@ def test_observer_workflow_fixtures_match_trigger_event_shape(
     assert payload["source_event_name"] == expected_event_name
     assert payload["source_event_action"] == expected_event_action
     assert expected_event_name in on_block
+
+
+def test_dismissed_review_observer_does_not_export_submitted_at_as_dismissal_time():
+    workflow_text = Path(".github/workflows/reviewer-bot-pr-review-dismissed-observer.yml").read_text(
+        encoding="utf-8"
+    )
+    fixture = _load_fixture_payload("tests/fixtures/observer_payloads/workflow_pr_review_dismissed_deferred.json")
+
+    assert "source_dismissed_at" not in workflow_text
+    assert "github.event.review.submitted_at" not in workflow_text
+    assert "github.event.review.updated_at" not in workflow_text
+    assert "source_dismissed_at" not in fixture
