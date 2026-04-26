@@ -99,6 +99,84 @@ def test_parse_deferred_context_payload_rejects_non_boolean_performed_via_app():
         reconcile.parse_deferred_context_payload(payload)
 
 
+def test_parse_deferred_context_payload_rejects_review_comment_without_source_commit_id():
+    payload = review_comment_payload(
+        pr_number=42,
+        comment_id=310,
+        source_event_key="pull_request_review_comment:310",
+        body="plain text review comment",
+        comment_class="plain_text",
+        has_non_command_text=True,
+        source_created_at="2026-03-17T10:00:00Z",
+        actor_login="alice",
+        actor_id=11,
+        actor_class="repo_user_principal",
+        pull_request_review_id=77,
+        in_reply_to_id=0,
+        source_run_id=711,
+        source_run_attempt=1,
+        source_commit_id=None,
+    )
+
+    with pytest.raises(RuntimeError, match="source_commit_id must be a non-empty string"):
+        reconcile.parse_deferred_context_payload(payload)
+
+
+def test_parse_deferred_context_payload_rejects_kind_event_mismatch():
+    payload = issue_comment_payload(
+        pr_number=42,
+        comment_id=210,
+        source_event_key="issue_comment:210",
+        body="@guidelines-bot /queue",
+        comment_class="command_only",
+        has_non_command_text=False,
+        source_created_at="2026-03-17T10:00:00Z",
+        actor_login="bob",
+        source_run_id=610,
+        source_run_attempt=1,
+    )
+    payload["payload_kind"] = "deferred_review_submitted"
+
+    with pytest.raises(RuntimeError, match="kind/event mismatch"):
+        reconcile.parse_deferred_context_payload(payload)
+
+
+def test_parse_deferred_context_payload_rejects_source_event_key_prefix_mismatch():
+    payload = issue_comment_payload(
+        pr_number=42,
+        comment_id=210,
+        source_event_key="pull_request_review_comment:210",
+        body="@guidelines-bot /queue",
+        comment_class="command_only",
+        has_non_command_text=False,
+        source_created_at="2026-03-17T10:00:00Z",
+        actor_login="bob",
+        source_run_id=610,
+        source_run_attempt=1,
+    )
+
+    with pytest.raises(RuntimeError, match="source_event_key prefix mismatch"):
+        reconcile.parse_deferred_context_payload(payload)
+
+
+def test_parse_deferred_context_payload_rejects_source_event_key_object_mismatch():
+    payload = issue_comment_payload(
+        pr_number=42,
+        comment_id=210,
+        source_event_key="issue_comment:999",
+        body="@guidelines-bot /queue",
+        comment_class="command_only",
+        has_non_command_text=False,
+        source_created_at="2026-03-17T10:00:00Z",
+        actor_login="bob",
+        source_run_id=610,
+        source_run_attempt=1,
+    )
+
+    with pytest.raises(RuntimeError, match="source_event_key object mismatch"):
+        reconcile.parse_deferred_context_payload(payload)
+
+
 def test_build_deferred_comment_replay_context_returns_typed_context():
     payload = reconcile.DeferredCommentPayload(
         identity=reconcile.DeferredArtifactIdentity(
@@ -251,12 +329,162 @@ def test_reconcile_active_review_entry_uses_explicit_head_repair_changed_field(m
 
 
 def test_parse_deferred_context_payload_rejects_unsupported_payload():
-    with pytest.raises(RuntimeError, match="schema_version is not accepted"):
+    with pytest.raises(RuntimeError, match="Unsupported deferred workflow_run payload"):
         reconcile.parse_deferred_context_payload({"schema_version": 2})
 
 
+def test_parse_deferred_context_payload_accepts_legacy_comment_payload():
+    payload = {
+        "schema_version": 2,
+        "source_event_name": "issue_comment",
+        "source_event_action": "created",
+        "source_event_key": "issue_comment:210",
+        "pr_number": 42,
+        "comment_id": 210,
+        "comment_class": "plain_text",
+        "has_non_command_text": True,
+        "source_body_digest": "digest",
+        "source_created_at": "2026-03-17T10:00:00Z",
+        "actor_login": "alice",
+        "actor_id": 7001,
+        "source_run_id": 1,
+        "source_run_attempt": 1,
+    }
+
+    parsed = reconcile.parse_deferred_context_payload(payload)
+
+    assert isinstance(parsed, reconcile.DeferredCommentPayload)
+    assert parsed.identity.payload_kind == reconcile_payloads.DeferredPayloadKind.DEFERRED_COMMENT
+    assert parsed.comment_created_at == "2026-03-17T10:00:00Z"
+    assert parsed.comment_author == "alice"
+    assert parsed.comment_author_id == 7001
+    assert parsed.source_body_digest == "digest"
+    assert parsed.source_comment_class == "plain_text"
+    assert parsed.source_has_non_command_text is True
+
+
+def test_legacy_review_comment_commit_hydration_updates_typed_payload():
+    payload = {
+        "schema_version": 2,
+        "source_event_name": "pull_request_review_comment",
+        "source_event_action": "created",
+        "source_event_key": "pull_request_review_comment:310",
+        "pr_number": 42,
+        "comment_id": 310,
+        "comment_class": "plain_text",
+        "has_non_command_text": True,
+        "source_body_digest": "digest",
+        "source_created_at": "2026-03-17T10:00:00Z",
+        "actor_login": "alice",
+        "actor_id": 7001,
+        "source_run_id": 1,
+        "source_run_attempt": 1,
+    }
+    parsed = reconcile.parse_deferred_context_payload(payload)
+    assert isinstance(parsed, reconcile.DeferredCommentPayload)
+    context = reconcile.build_deferred_comment_replay_context(
+        parsed,
+        expected_event_name="pull_request_review_comment",
+        live_comment_endpoint="pulls/comments/310",
+    )
+
+    hydrated = reconcile._hydrate_live_review_comment_commit_id(context, {"commit_id": " head-1 "})
+
+    assert hydrated is not None
+    assert hydrated.payload.source_commit_id == "head-1"
+    assert parsed.raw_payload["source_commit_id"] == "head-1"
+
+
+def test_recover_deferred_payload_identity_builds_sanitized_payload_without_mutating_source():
+    payload = issue_comment_payload(
+        pr_number=42,
+        comment_id=210,
+        source_event_key="issue_comment:210",
+        body="@guidelines-bot /queue",
+        comment_class="command_only",
+        has_non_command_text=False,
+        source_created_at="2026-03-17T10:00:00Z",
+        actor_login="bob",
+        source_run_id=610,
+        source_run_attempt=1,
+    )
+    before = dict(payload)
+
+    recovered = reconcile_payloads.recover_deferred_payload_identity(payload)
+
+    assert payload == before
+    assert recovered.source_event_key == "issue_comment:210"
+    assert recovered.source_object_id == 210
+    assert recovered.diagnostic_payload["source_comment_id"] == 210
+    assert recovered.diagnostic_payload["source_event_created_at"] == "2026-03-17T10:00:00Z"
+
+
+def test_recover_deferred_payload_identity_rejects_invalid_timestamp():
+    payload = issue_comment_payload(
+        pr_number=42,
+        comment_id=210,
+        source_event_key="issue_comment:210",
+        body="@guidelines-bot /queue",
+        comment_class="command_only",
+        has_non_command_text=False,
+        source_created_at="not-a-timestamp",
+        actor_login="bob",
+        source_run_id=610,
+        source_run_attempt=1,
+    )
+
+    with pytest.raises(RuntimeError, match="timestamp is not parseable"):
+        reconcile_payloads.recover_deferred_payload_identity(payload)
+
+
+def test_parse_deferred_context_payload_normalizes_legacy_app_flag_strings():
+    payload = {
+        "schema_version": 2,
+        "source_event_name": "issue_comment",
+        "source_event_action": "created",
+        "source_event_key": "issue_comment:210",
+        "pr_number": 42,
+        "comment_id": 210,
+        "comment_class": "plain_text",
+        "has_non_command_text": True,
+        "source_body_digest": "digest",
+        "source_created_at": "2026-03-17T10:00:00Z",
+        "actor_login": "alice",
+        "source_run_id": 1,
+        "source_run_attempt": 1,
+        "comment_performed_via_github_app": "false",
+    }
+
+    parsed = reconcile.parse_deferred_context_payload(payload)
+
+    assert isinstance(parsed, reconcile.DeferredCommentPayload)
+    assert parsed.comment_performed_via_github_app is False
+
+
+def test_parse_deferred_context_payload_rejects_invalid_legacy_app_flag():
+    payload = {
+        "schema_version": 2,
+        "source_event_name": "issue_comment",
+        "source_event_action": "created",
+        "source_event_key": "issue_comment:210",
+        "pr_number": 42,
+        "comment_id": 210,
+        "comment_class": "plain_text",
+        "has_non_command_text": True,
+        "source_body_digest": "digest",
+        "source_created_at": "2026-03-17T10:00:00Z",
+        "actor_login": "alice",
+        "source_run_id": 1,
+        "source_run_attempt": 1,
+        "comment_performed_via_github_app": "not-a-bool",
+    }
+
+    with pytest.raises(RuntimeError, match="comment_performed_via_github_app must be boolean"):
+        reconcile.parse_deferred_context_payload(payload)
+
+
 def test_parse_deferred_context_payload_rejects_observer_noop_payload():
-    with pytest.raises(RuntimeError, match="schema_version is not accepted"):
+    with pytest.raises(RuntimeError, match="Unsupported deferred workflow_run payload"):
         reconcile.parse_deferred_context_payload(
             {
                 "schema_version": 1,

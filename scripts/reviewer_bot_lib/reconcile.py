@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from scripts.reviewer_bot_core import comment_routing_policy, reconcile_replay_policy
 from scripts.reviewer_bot_core.comment_routing_policy import (
@@ -246,7 +246,64 @@ def optional_router_payload_missing(bot: ReconcileWorkflowRuntimeContext, event_
     return False
 
 
+_DEFERRED_PARSE_ERRORS = (RuntimeError, KeyError, TypeError, ValueError)
+
+
+def _payload_source_commit_id(payload: dict) -> str | None:
+    source_commit_id = payload.get("source_commit_id")
+    if not isinstance(source_commit_id, str) or not source_commit_id.strip():
+        return None
+    return source_commit_id.strip()
+
+
+def _hydrate_live_review_comment_commit_id(
+    context: DeferredCommentReplayContext,
+    live_comment: dict,
+) -> DeferredCommentReplayContext | None:
+    if context.expected_event_name != "pull_request_review_comment":
+        return context
+    payload = context.payload.raw_payload
+    source_commit_id = context.payload.source_commit_id or _payload_source_commit_id(payload)
+    if source_commit_id is not None:
+        payload["source_commit_id"] = source_commit_id
+        if context.payload.source_commit_id == source_commit_id:
+            return context
+        return replace(context, payload=replace(context.payload, source_commit_id=source_commit_id))
+    live_commit_id = live_comment.get("commit_id")
+    if isinstance(live_commit_id, str) and live_commit_id.strip():
+        source_commit_id = live_commit_id.strip()
+        payload["source_commit_id"] = source_commit_id
+        return replace(context, payload=replace(context.payload, source_commit_id=source_commit_id))
+    return None
+
+
+def _record_missing_review_comment_commit_id(
+    bot: ReconcileWorkflowRuntimeContext,
+    review_data: dict,
+    payload: dict,
+    *,
+    failure_kind: str | None = "invalid_payload",
+) -> bool:
+    return gap_bookkeeping.record_deferred_gap_diagnostic(
+        bot,
+        review_data,
+        payload,
+        "artifact_invalid",
+        (
+            "Deferred review comment artifact source_commit_id could not be recovered from live review comment; "
+            f"replay suppressed. See {bot.REVIEW_FRESHNESS_RUNBOOK_PATH}."
+        ),
+        failure_kind=failure_kind,
+    )
+
+
 def _classify_deferred_comment_payload(payload: DeferredCommentPayload) -> dict:
+    if payload.source_comment_class is not None and payload.source_has_non_command_text is not None:
+        return {
+            "comment_class": payload.source_comment_class,
+            "has_non_command_text": payload.source_has_non_command_text,
+            "command_count": 1 if payload.source_comment_class in {"command_only", "command_plus_text"} else 0,
+        }
     normalized_body = "\n".join(line.rstrip() for line in payload.comment_body.replace("\r\n", "\n").split("\n")).strip()
     classified = comment_routing_policy.classify_comment_payload(
         "@guidelines-bot",
@@ -260,6 +317,12 @@ def _classify_deferred_comment_payload(payload: DeferredCommentPayload) -> dict:
     }
 
 
+def _deferred_comment_body_digest_matches(payload: DeferredCommentPayload, live_body: str) -> bool:
+    if payload.source_body_digest is not None:
+        return digest_comment_body(live_body) == payload.source_body_digest
+    return digest_comment_body(live_body) == digest_comment_body(payload.comment_body)
+
+
 def _reconcile_deferred_comment(
     bot: ReconcileWorkflowRuntimeContext,
     state: dict,
@@ -269,7 +332,7 @@ def _reconcile_deferred_comment(
     payload = context.payload.raw_payload
     comment_id = context.comment_id
     pr_number = context.pr_number
-    _read_live_pr_replay_context(bot, pr_number)
+    live_pr_context = _read_live_pr_replay_context(bot, pr_number)
     source_freshness_eligible = context.source_freshness_eligible
     source_classified = _classify_deferred_comment_payload(context.payload)
 
@@ -277,6 +340,7 @@ def _reconcile_deferred_comment(
         return build_replay_comment_event_request(
             context.payload,
             live_comment=comment_context,
+            live_pr=live_pr_context,
             comment_body=comment_body,
         )
 
@@ -292,6 +356,13 @@ def _reconcile_deferred_comment(
     try:
         live_comment = _read_reconcile_object(bot, context.live_comment_endpoint, label=f"deferred comment {comment_id}")
     except ReconcileReadError as exc:
+        if context.expected_event_name == "pull_request_review_comment" and _payload_source_commit_id(payload) is None:
+            return _record_missing_review_comment_commit_id(
+                bot,
+                review_data,
+                payload,
+                failure_kind=exc.failure_kind,
+            )
         decision = reconcile_replay_policy.decide_comment_replay(
             comment_id=comment_id,
             source_comment_class=str(source_classified.get("comment_class", ObserverCommentClassification.PLAIN_TEXT)),
@@ -318,12 +389,16 @@ def _reconcile_deferred_comment(
             failure_kind=decision.failure_kind,
         )
         return changed or gap_changed
+    hydrated_context = _hydrate_live_review_comment_commit_id(context, live_comment)
+    if hydrated_context is None:
+        return _record_missing_review_comment_commit_id(bot, review_data, payload)
+    context = hydrated_context
     comment_context = _read_live_comment_replay_context(live_comment, payload)
     live_body = live_comment.get("body")
     if not isinstance(live_body, str):
         raise RuntimeError("Live deferred comment body is unavailable")
     live_classified = classify_comment_payload(bot, live_body)
-    if digest_comment_body(live_body) != digest_comment_body(context.payload.comment_body):
+    if not _deferred_comment_body_digest_matches(context.payload, live_body):
         decision = reconcile_replay_policy.decide_comment_replay(
             comment_id=comment_id,
             source_comment_class=str(source_classified.get("comment_class", ObserverCommentClassification.PLAIN_TEXT)),
@@ -595,7 +670,66 @@ def handle_workflow_run_event_result(bot: ReconcileWorkflowRuntimeContext, state
         if event_context.workflow_artifact_contract == "artifact_optional_router" and _is_missing_optional_router_payload_error(exc):
             return WorkflowRunHandlerResult(False, [])
         raise
-    parsed_payload = parse_deferred_context_payload(payload)
+    try:
+        parsed_payload = parse_deferred_context_payload(payload)
+    except _DEFERRED_PARSE_ERRORS as exc:
+        try:
+            recovered_identity = _reconcile_payloads.recover_deferred_payload_identity(payload)
+        except RuntimeError as recover_exc:
+            raise RuntimeError(f"{recover_exc}; original parse error: {exc}") from exc
+        diagnostic_payload = recovered_identity.diagnostic_payload
+        _reconcile_payloads.validate_triggering_run_identity(bot, diagnostic_payload)
+        pr_number = recovered_identity.pr_number
+        review_data = ensure_review_entry(state, pr_number)
+        if review_data is None:
+            _log(
+                bot,
+                "info",
+                f"Ignoring invalid deferred workflow_run for missing active review entry on PR #{pr_number}",
+                issue_number=pr_number,
+                source_event_key=recovered_identity.source_event_key,
+            )
+            return WorkflowRunHandlerResult(False, [])
+        try:
+            live_pr_state = _read_live_pr_state_for_reconcile(bot, pr_number)
+            if live_pr_state == "closed":
+                _log(
+                    bot,
+                    "info",
+                    f"Ignoring invalid deferred workflow_run for closed PR #{pr_number}",
+                    issue_number=pr_number,
+                    source_event_key=recovered_identity.source_event_key,
+                )
+                return WorkflowRunHandlerResult(False, [])
+            if live_pr_state != "open":
+                raise ReconcileReadError(
+                    f"live PR #{pr_number} state is unsupported for replay: {live_pr_state}",
+                    failure_kind="invalid_payload",
+                )
+        except RuntimeError as live_pr_exc:
+            bot.collect_touched_item(pr_number)
+            failure_kind = live_pr_exc.failure_kind if isinstance(live_pr_exc, ReconcileReadError) else None
+            gap_changed = gap_bookkeeping.record_deferred_gap_diagnostic(
+                bot,
+                review_data,
+                diagnostic_payload,
+                "reconcile_failed_closed",
+                f"{live_pr_exc} See {bot.REVIEW_FRESHNESS_RUNBOOK_PATH}.",
+                failure_kind=failure_kind,
+            )
+            if gap_changed:
+                return _build_result(True, pr_number)
+            raise
+        bot.collect_touched_item(pr_number)
+        gap_changed = gap_bookkeeping.record_deferred_gap_diagnostic(
+            bot,
+            review_data,
+            diagnostic_payload,
+            "artifact_invalid",
+            f"{exc} See {bot.REVIEW_FRESHNESS_RUNBOOK_PATH}.",
+            failure_kind="invalid_payload",
+        )
+        return _build_result(gap_changed, pr_number)
     pr_number = parsed_payload.pr_number
     if pr_number <= 0:
         raise RuntimeError("Deferred context is missing a valid PR number")

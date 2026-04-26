@@ -20,6 +20,25 @@ from . import live_review_support, reviewer_review_helpers
 
 _UNSET = object()
 _ASSIGNMENT_GUIDANCE_AUTHORS = {"github-actions", "github-actions[bot]", "guidelines-bot"}
+_FAIL_CLOSED_REVIEWER_ACTIVITY_GAP_REASONS = frozenset(
+    {
+        "observer_failed",
+        "observer_cancelled",
+        "observer_run_missing",
+        "observer_state_unknown",
+        "artifact_missing",
+        "artifact_invalid",
+        "artifact_expired",
+        "reconcile_failed_closed",
+    }
+)
+_REVIEWER_ACTIVITY_GAP_KINDS = frozenset(
+    {
+        "issue_comment:created",
+        "pull_request_review:submitted",
+        "pull_request_review_comment:created",
+    }
+)
 
 
 def _record_timestamp(record: dict | None, *, parse_timestamp) -> datetime | None:
@@ -137,6 +156,102 @@ def _build_current_scope_key(
         f"reviewer={current_reviewer}|head={_scope_value(current_head)}|"
         f"cycle={_scope_value(cycle_boundary)}|anchor={_scope_value(anchor_timestamp)}"
     )
+
+
+def _gap_source_kind(gap: dict) -> str | None:
+    source_event_kind = gap.get("source_event_kind")
+    if isinstance(source_event_kind, str) and source_event_kind.strip():
+        return source_event_kind
+    source_event_key = gap.get("source_event_key")
+    if not isinstance(source_event_key, str):
+        return None
+    if source_event_key.startswith("issue_comment:"):
+        return "issue_comment:created"
+    if source_event_key.startswith("pull_request_review_comment:"):
+        return "pull_request_review_comment:created"
+    if source_event_key.startswith("pull_request_review:"):
+        return "pull_request_review:submitted"
+    return None
+
+
+def _gap_event_timestamp(gap: dict):
+    return live_review_support.parse_github_timestamp(gap.get("source_event_created_at"))
+
+
+def _visible_review_commit_id(gap: dict) -> str | None:
+    diagnostic = gap.get("visible_review_diagnostic")
+    payload = diagnostic.get("payload") if isinstance(diagnostic, dict) else None
+    commit_id = payload.get("commit_id") if isinstance(payload, dict) else None
+    if isinstance(commit_id, str) and commit_id.strip():
+        return commit_id
+    source_commit_id = gap.get("source_commit_id")
+    if isinstance(source_commit_id, str) and source_commit_id.strip():
+        return source_commit_id
+    comment = gap.get("comment")
+    comment_commit_id = None
+    if isinstance(comment, dict):
+        comment_commit_id = comment.get("commit_id") or comment.get("original_commit_id")
+    return comment_commit_id if isinstance(comment_commit_id, str) and comment_commit_id.strip() else None
+
+
+def _visible_activity_author(gap: dict) -> str | None:
+    diagnostic = gap.get("visible_review_diagnostic")
+    payload = diagnostic.get("payload") if isinstance(diagnostic, dict) else None
+    author = payload.get("author") if isinstance(payload, dict) else None
+    if isinstance(author, str) and author.strip():
+        return author
+    source_actor = gap.get("source_actor_login")
+    if isinstance(source_actor, str) and source_actor.strip():
+        return source_actor
+    actor = gap.get("actor")
+    if isinstance(actor, str) and actor.strip():
+        return actor
+    comment = gap.get("comment")
+    user = comment.get("user") if isinstance(comment, dict) else None
+    login = user.get("login") if isinstance(user, dict) else None
+    return login if isinstance(login, str) and login.strip() else None
+
+
+def has_fail_closed_reviewer_activity_for_current_scope(
+    review_data: dict,
+    fail_closed_gaps,
+    *,
+    anchor_timestamp: str | None = None,
+    current_head_sha: str | None = None,
+) -> bool:
+    current_reviewer = review_data.get("current_reviewer")
+    if not isinstance(current_reviewer, str) or not current_reviewer.strip():
+        return False
+    floor = live_review_support.parse_github_timestamp(anchor_timestamp)
+    if floor is None:
+        _, cycle_boundary = _initial_cycle_boundary(review_data)
+        floor = live_review_support.parse_github_timestamp(cycle_boundary)
+    for gap in fail_closed_gaps:
+        if not isinstance(gap, dict):
+            continue
+        if gap.get("operator_action_required") is not True:
+            continue
+        if gap.get("reason") not in _FAIL_CLOSED_REVIEWER_ACTIVITY_GAP_REASONS:
+            continue
+        source_kind = _gap_source_kind(gap)
+        if source_kind not in _REVIEWER_ACTIVITY_GAP_KINDS:
+            continue
+        event_timestamp = _gap_event_timestamp(gap)
+        if event_timestamp is None:
+            continue
+        if floor is not None and event_timestamp < floor:
+            continue
+        author = _visible_activity_author(gap)
+        if not isinstance(author, str) or author.lower() != current_reviewer.lower():
+            continue
+        if source_kind in {"pull_request_review:submitted", "pull_request_review_comment:created"}:
+            if not isinstance(current_head_sha, str) or not current_head_sha.strip():
+                continue
+            commit_id = _visible_review_commit_id(gap)
+            if commit_id != current_head_sha:
+                continue
+        return True
+    return False
 
 
 def _current_scope_fields(
@@ -478,6 +593,7 @@ def derive_reviewer_response_state(
                 reason="no_reviewer_activity",
                 scope_fields=_current_scope_fields(review_data, current_reviewer, current_head, None),
                 anchor_timestamp=_initial_reviewer_anchor(review_data),
+                current_head_sha=current_head,
                 reviewer_comment=reviewer_comment,
                 reviewer_review=reviewer_review,
                 current_cycle_reviewer_handoff=reviewer_handoff,
