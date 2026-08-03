@@ -151,7 +151,7 @@ def test_get_state_issue_snapshot_builds_html_url_from_runtime_config_when_missi
             transport_error=None,
         )
 
-    config = {"REPO_OWNER": "rustfoundation", "REPO_NAME": "safety-critical-rust-coding-guidelines"}
+    config = {"REPO_OWNER": "Safety-Critical-Rust-Consortium", "REPO_NAME": "safety-critical-rust-coding-guidelines"}
     bot = _bot(monkeypatch, github_api_request=fake_request)
     bot.state_issue_number = lambda: 1
     bot.get_config_value = lambda name, default="": config.get(name, default)
@@ -159,7 +159,7 @@ def test_get_state_issue_snapshot_builds_html_url_from_runtime_config_when_missi
     snapshot = state_store.get_state_issue_snapshot(bot)
 
     assert snapshot is not None
-    assert snapshot.html_url == "https://github.com/rustfoundation/safety-critical-rust-coding-guidelines/issues/1"
+    assert snapshot.html_url == "https://github.com/Safety-Critical-Rust-Consortium/safety-critical-rust-coding-guidelines/issues/1"
 
 
 def test_loaded_state_fails_closed_for_invalid_legacy_review_entry_shape(monkeypatch):
